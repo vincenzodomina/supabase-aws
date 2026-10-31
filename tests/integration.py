@@ -110,6 +110,7 @@ def run(directory, package):
     internal_s3 = session.client('s3', endpoint_url='http://moto:5000', config=config)
     for bucket in ['artifacts', 'integration']:
         s3.create_bucket(Bucket=bucket)
+    s3.put_bucket_versioning(Bucket='integration', VersioningConfiguration=template['Resources']['Bucket']['Properties']['VersioningConfiguration'])
 
     password = secrets.token_hex(24)
     fixture_secrets = {'ApiSecret': {'JWT_SECRET': secrets.token_hex(32)},
@@ -413,6 +414,13 @@ def run(directory, package):
 
     check_storage(url, keys, after_upload=retry_with_existing_data)
     assert not s3.list_objects_v2(Bucket='integration').get('Contents'), 'Storage deletion left an S3 object'
+    versions = s3.list_object_versions(Bucket='integration')
+    assert versions.get('Versions') and versions.get('DeleteMarkers'), 'Versioned storage must retain history after API deletion'
+    for version in versions['Versions'] + versions['DeleteMarkers']:
+        s3.delete_object(Bucket='integration', Key=version['Key'], VersionId=version['VersionId'])
+    purged = s3.list_object_versions(Bucket='integration')
+    assert not purged.get('Versions') and not purged.get('DeleteMarkers'), 'Administrator purge left version history'
+    print('PASS: API deletion retains S3 history; explicit version purge removes the disposable fixture history.', flush=True)
     assert invoke(lambdaport, 'Delete', physical_id=identity) == identity
     assert request(url+'/auth/v1/user', headers=dict(publishable, Authorization='Bearer '+user['access_token']))[0] == 200
     modes = docker('exec', prefix+'-gateway', 'stat', '-c', '%a', '/etc/envoy/lds.yaml')

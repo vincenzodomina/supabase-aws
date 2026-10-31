@@ -177,6 +177,28 @@ class DeploymentTest(unittest.TestCase):
 
 
 class ArtifactTest(unittest.TestCase):
+    def test_storage_history_expiry_is_opt_in_and_preserves_current_objects(self):
+        template, errors = decode_str(subprocess.check_output([str(ROOT/'src/deploy.sh'), '--template'], text=True, timeout=10))
+        self.assertFalse(errors)
+        parameter = 'StorageNoncurrentVersionRetentionDays'
+        self.assertEqual(template['Parameters'][parameter]['Default'], 0)
+        bucket = template['Resources']['Bucket']
+        self.assertEqual(bucket['Properties']['VersioningConfiguration']['Status'], 'Enabled')
+        self.assertEqual(bucket['DeletionPolicy'], 'Retain')
+        self.assertEqual(bucket['UpdateReplacePolicy'], 'Retain')
+        rules = bucket['Properties']['LifecycleConfiguration']['Rules']
+        self.assertEqual(next(r for r in rules if r.get('Id') == 'AbortIncompleteUploads')['AbortIncompleteMultipartUpload'],
+                         {'DaysAfterInitiation': 7})
+        condition, rule, absent = next(r['Fn::If'] for r in rules if 'Fn::If' in r)
+        self.assertEqual(template['Conditions'][condition], {'Fn::Not': [{'Fn::Equals': [{'Ref': parameter}, 0]}]})
+        self.assertEqual(absent, {'Ref': 'AWS::NoValue'})
+        self.assertEqual(rule['NoncurrentVersionExpiration'], {'NoncurrentDays': {'Ref': parameter}})
+        self.assertEqual(rule['Status'], 'Enabled')
+        for candidate in [rule, *(r for r in rules if 'Fn::If' not in r)]:
+            self.assertFalse({'ExpirationInDays', 'ExpirationDate', 'ExpiredObjectDeleteMarker'} & candidate.keys())
+        statements = template['Resources']['StorageRole']['Properties']['Policies'][0]['PolicyDocument']['Statement']
+        self.assertNotIn('s3:DeleteObjectVersion', str(statements))
+
     def test_service_log_retention_is_opt_in_and_cannot_delete_log_groups(self):
         template, errors = decode_str(subprocess.check_output([str(ROOT/'src/deploy.sh'), '--template'], text=True, timeout=10))
         self.assertFalse(errors)
