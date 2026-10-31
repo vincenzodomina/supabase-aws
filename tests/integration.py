@@ -35,17 +35,21 @@ LAMBDA_IMAGE = 'public.ecr.aws/lambda/python:3.13@sha256:4878ebcc1df9c6b55770d66
 MOTO_IMAGE = 'motoserver/moto:5.2.5@sha256:59a1965d845249b04def37a0e2565f9cc6c44543cb89b68e90f28f344b3b0d1a'
 prefix = 'supabase-check-' + secrets.token_hex(4)
 containers = []
+ecs_architecture = os.environ.get('ECS_CPU_ARCHITECTURE', template['Parameters']['EcsCpuArchitecture']['Default'])
+assert ecs_architecture in template['Parameters']['EcsCpuArchitecture']['AllowedValues'], 'Unsupported ECS_CPU_ARCHITECTURE'
+ecs_platform = {'X86_64': 'linux/amd64', 'ARM64': 'linux/arm64'}[ecs_architecture]
 
 
 def docker(*args, stderr=subprocess.PIPE, **kwargs):
     return subprocess.check_output(['docker', *args], text=True, stderr=stderr, timeout=180, **kwargs).strip()
 
 
-def start(name, image, environment, port=None, alias=None, mounts=(), entrypoint=None, command=(), network=None):
+def start(name, image, environment, port=None, alias=None, mounts=(), entrypoint=None, command=(), network=None,
+          platform='linux/amd64', extra_ports=()):
     name = prefix+'-'+name
-    args = ['run', '-d', '--platform', 'linux/amd64', '--name', name, '--network', network or prefix]
-    if port:
-        args += ['-p', f'127.0.0.1::{port}']
+    args = ['run', '-d', '--platform', platform, '--name', name, '--network', network or prefix]
+    for exposed in (*extra_ports, *([port] if port else [])):
+        args += ['-p', f'127.0.0.1::{exposed}']
     if alias:
         args += ['--network-alias', alias]
     for mount in mounts:
@@ -115,6 +119,7 @@ def run(directory, package):
     password = secrets.token_hex(24)
     fixture_secrets = {'ApiSecret': {'JWT_SECRET': secrets.token_hex(32)},
                        'DatabaseSecret': {'username': 'postgres', 'password': password},
+                       'MetaSecret': {'crypto_key': secrets.token_hex(24)},
                        'AuthSecret': {'password': password}, 'RestSecret': {'password': password},
                        'StorageSecret': {'password': password}, 'SesSmtpSecretArn': {'username': '', 'password': ''}}
     properties = {name: sm.create_secret(Name=name, SecretString=json.dumps(value))['ARN']
@@ -260,8 +265,10 @@ def run(directory, package):
     keys = dict(fixture_secrets['ApiSecret'])
     print('PASS: packaged Lambda, rollback/recovery, baseline validation, immutable migration history, private ledger and TLS rejection.', flush=True)
 
-    def start_service(name, overrides=None):
-        task = template['Resources'][name.title()+'Task']['Properties']
+    def start_service(name, overrides=None, network=None, extra_ports=()):
+        task_name = 'AdminTask' if name in ('meta', 'studio') else name.title()+'Task'
+        task = template['Resources'][task_name]['Properties']
+        assert task['RuntimePlatform']['CpuArchitecture'] == {'Ref': 'EcsCpuArchitecture'}
         definition = next(c for c in task['ContainerDefinitions'] if c['Name'] == name)
         environment = {}
         for item in definition.get('Environment', []):
@@ -269,6 +276,8 @@ def run(directory, package):
             if isinstance(value, dict):
                 if 'Ref' in value:
                     value = values[value['Ref']]
+                elif value == {'Fn::GetAtt': ['Database', 'Endpoint.Address']}:
+                    value = 'db'
                 else:
                     value = re.sub(r'\$\{([^}]+)\}', lambda m: str(values[m[1]]), value['Fn::Sub'])
             environment[item['Name']] = str(value)
@@ -277,16 +286,19 @@ def run(directory, package):
             environment[item['Name']] = fixture_secrets[source[1]][source[2]]
         environment.update(overrides or {})
         entrypoint = definition.get('EntryPoint', [])
-        return start(name, definition['Image'], environment, definition['PortMappings'][0]['ContainerPort'],
-                     name+'.test.internal', mounts=[certmount], entrypoint=entrypoint[0] if entrypoint else None,
-                     command=entrypoint[1:]+definition.get('Command', []))
+        port = 8080 if name == 'meta' else definition['PortMappings'][0]['ContainerPort']
+        return start(name, definition['Image'], environment, port if not network else None,
+                     name+'.test.internal' if not network else None, mounts=[certmount],
+                     entrypoint=entrypoint[0] if entrypoint else None,
+                     command=entrypoint[1:]+definition.get('Command', []), network=network,
+                     platform=ecs_platform, extra_ports=extra_ports)
 
     certificate = template['Resources']['AuthTask']['Properties']['ContainerDefinitions'][0]
     readiness = next(c for c in template['Resources']['RestTask']['Properties']['ContainerDefinitions'] if c['Name'] == 'readiness')
     s3.put_object(Bucket='artifacts', Key='rds-ca.pem', Body=(directory/'rds-ca.pem').read_bytes())
     command = ['s3://artifacts/rds-ca.pem' if isinstance(v, dict) else v for v in certificate['Command']]
     start('certificates', certificate['Image'], dict(aws_env, AWS_ENDPOINT_URL='http://moto:5000'),
-          mounts=[prefix+':/shared'], command=command)
+          mounts=[prefix+':/shared'], command=command, platform=ecs_platform)
     assert docker('wait', prefix+'-certificates') == '0', 'Certificate download failed'
     certmount = prefix+':/certs:ro'
     authport = start_service('auth', {'GOTRUE_DISABLE_SIGNUP': 'false', 'GOTRUE_MAILER_AUTOCONFIRM': 'true'})
@@ -327,7 +339,7 @@ def run(directory, package):
         assert any(notification.payload == 'reload schema' for notification in listener.notifies(timeout=5, stop_after=1)), 'ALTER TYPE did not notify PostgREST'
         writer.execute('DROP TYPE public.integration_type')
     start('readiness', readiness['Image'], {}, network='container:'+prefix+'-rest',
-          entrypoint=readiness['EntryPoint'][0], command=readiness['EntryPoint'][1:]+readiness['Command'])
+          entrypoint=readiness['EntryPoint'][0], command=readiness['EntryPoint'][1:]+readiness['Command'], platform=ecs_platform)
     docker('exec', prefix+'-readiness', *readiness['HealthCheck']['Command'][1:])
     storageport = start_service('storage', dict(aws_env, STORAGE_S3_ENDPOINT='http://moto:5000', STORAGE_S3_FORCE_PATH_STYLE='true'))
     wait_http(f'http://127.0.0.1:{storageport}/status')
@@ -421,6 +433,13 @@ def run(directory, package):
     purged = s3.list_object_versions(Bucket='integration')
     assert not purged.get('Versions') and not purged.get('DeleteMarkers'), 'Administrator purge left version history'
     print('PASS: API deletion retains S3 history; explicit version purge removes the disposable fixture history.', flush=True)
+    metaport = start_service('meta', extra_ports=(3000,))
+    wait_http(f'http://127.0.0.1:{metaport}/health')
+    assert request(f'http://127.0.0.1:{metaport}/tables')[0] == 200, 'Meta could not read database metadata'
+    start_service('studio', network='container:'+prefix+'-meta')
+    studioport = int(docker('port', prefix+'-meta', '3000').rsplit(':', 1)[1])
+    wait_http(f'http://127.0.0.1:{studioport}/api/platform/profile')
+    print(f'PASS: {ecs_architecture} application/helper containers and paired Studio/meta startup.', flush=True)
     assert invoke(lambdaport, 'Delete', physical_id=identity) == identity
     assert request(url+'/auth/v1/user', headers=dict(publishable, Authorization='Bearer '+user['access_token']))[0] == 200
     modes = docker('exec', prefix+'-gateway', 'stat', '-c', '%a', '/etc/envoy/lds.yaml')
@@ -430,7 +449,7 @@ def run(directory, package):
         assert all(value not in logs for value in [password, *keys.values()]), 'Credentials appeared in container logs'
     gateway = template['Resources']['GatewayTask']['Properties']['ContainerDefinitions'][0]
     start('gateway-missing-env', gateway['Image'], {}, entrypoint=gateway['EntryPoint'][0],
-          command=gateway['EntryPoint'][1:]+gateway['Command'])
+          command=gateway['EntryPoint'][1:]+gateway['Command'], platform=ecs_platform)
     assert docker('wait', prefix+'-gateway-missing-env') != '0', 'Gateway accepted missing configuration'
     docker('stop', prefix+'-rest')
     try:

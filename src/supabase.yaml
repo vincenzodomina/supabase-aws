@@ -4,6 +4,11 @@ Parameters:
   VpcId:
     Type: AWS::EC2::VPC::Id
     Description: Existing VPC with DNS support and hostnames enabled.
+  EcsCpuArchitecture:
+    Type: String
+    Description: Architecture for all ECS containers. ARM64 requires supported Fargate AZs; see docs/Compute.md. Lambda packaging is unchanged.
+    AllowedValues: [X86_64, ARM64]
+    Default: X86_64
   PublicSubnetIds:
     Type: CommaDelimitedList
     Description: Two public subnets in distinct AZs; required only for internet-facing API access.
@@ -1148,7 +1153,7 @@ Resources:
       RequiresCompatibilities:
         - FARGATE
       RuntimePlatform:
-        CpuArchitecture: X86_64
+        CpuArchitecture: !Ref 'EcsCpuArchitecture'
         OperatingSystemFamily: LINUX
       ExecutionRoleArn: !GetAtt 'GatewayExecutionRole.Arn'
       ContainerDefinitions:
@@ -2092,7 +2097,7 @@ Resources:
       RequiresCompatibilities:
         - FARGATE
       RuntimePlatform:
-        CpuArchitecture: X86_64
+        CpuArchitecture: !Ref 'EcsCpuArchitecture'
         OperatingSystemFamily: LINUX
       ExecutionRoleArn: !GetAtt 'AuthExecutionRole.Arn'
       TaskRoleArn: !GetAtt 'CertificatesRole.Arn'
@@ -2286,7 +2291,7 @@ Resources:
       RequiresCompatibilities:
         - FARGATE
       RuntimePlatform:
-        CpuArchitecture: X86_64
+        CpuArchitecture: !Ref 'EcsCpuArchitecture'
         OperatingSystemFamily: LINUX
       ExecutionRoleArn: !GetAtt 'RestExecutionRole.Arn'
       TaskRoleArn: !GetAtt 'CertificatesRole.Arn'
@@ -2452,7 +2457,7 @@ Resources:
       RequiresCompatibilities:
         - FARGATE
       RuntimePlatform:
-        CpuArchitecture: X86_64
+        CpuArchitecture: !Ref 'EcsCpuArchitecture'
         OperatingSystemFamily: LINUX
       ExecutionRoleArn: !GetAtt 'StorageExecutionRole.Arn'
       ContainerDefinitions:
@@ -2681,7 +2686,7 @@ Resources:
       RequiresCompatibilities:
         - FARGATE
       RuntimePlatform:
-        CpuArchitecture: X86_64
+        CpuArchitecture: !Ref 'EcsCpuArchitecture'
         OperatingSystemFamily: LINUX
       ExecutionRoleArn: !GetAtt 'AdminExecutionRole.Arn'
       TaskRoleArn: !GetAtt 'CertificatesRole.Arn'
