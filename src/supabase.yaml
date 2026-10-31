@@ -121,6 +121,13 @@ Parameters:
       - 180
       - 365
     Default: 30
+  ContainerInsights:
+    Type: String
+    Description: Optional paid ECS task telemetry; service metrics and application logs remain available when disabled.
+    AllowedValues:
+      - enabled
+      - disabled
+    Default: enabled
   FileSizeLimitBytes:
     Type: Number
     Description: Maximum Storage upload size.
@@ -271,7 +278,7 @@ Resources:
     Properties:
       ClusterSettings:
         - Name: containerInsights
-          Value: enabled
+          Value: !Ref 'ContainerInsights'
   Namespace:
     Type: AWS::ServiceDiscovery::PrivateDnsNamespace
     Properties:
@@ -329,6 +336,7 @@ Resources:
           CidrIp: 0.0.0.0/0
   AdminSG:
     Type: AWS::EC2::SecurityGroup
+    Condition: RunStudio
     Properties:
       GroupDescription: Admin Supabase access
       VpcId: !Ref 'VpcId'
@@ -339,6 +347,7 @@ Resources:
           CidrIp: 0.0.0.0/0
   AdminAlbSG:
     Type: AWS::EC2::SecurityGroup
+    Condition: RunStudio
     Properties:
       GroupDescription: AdminAlb Supabase access
       VpcId: !Ref 'VpcId'
@@ -377,6 +386,7 @@ Resources:
       CidrIp: 0.0.0.0/0
   AdminHttps:
     Type: AWS::EC2::SecurityGroupIngress
+    Condition: RunStudio
     Properties:
       GroupId: !Ref 'AdminAlbSG'
       IpProtocol: tcp
@@ -401,6 +411,7 @@ Resources:
       ToPort: 8000
   AdminUiIngress:
     Type: AWS::EC2::SecurityGroupIngress
+    Condition: RunStudio
     Properties:
       GroupId: !Ref 'AdminSG'
       SourceSecurityGroupId: !Ref 'AdminAlbSG'
@@ -409,6 +420,7 @@ Resources:
       ToPort: 3000
   AdminUiEgress:
     Type: AWS::EC2::SecurityGroupEgress
+    Condition: RunStudio
     Properties:
       GroupId: !Ref 'AdminAlbSG'
       DestinationSecurityGroupId: !Ref 'AdminSG'
@@ -417,6 +429,7 @@ Resources:
       ToPort: 3000
   AdminGatewayIngress:
     Type: AWS::EC2::SecurityGroupIngress
+    Condition: RunStudio
     Properties:
       GroupId: !Ref 'GatewaySG'
       SourceSecurityGroupId: !Ref 'AdminSG'
@@ -425,6 +438,7 @@ Resources:
       ToPort: 8000
   AdminGatewayEgress:
     Type: AWS::EC2::SecurityGroupEgress
+    Condition: RunStudio
     Properties:
       GroupId: !Ref 'AdminSG'
       DestinationSecurityGroupId: !Ref 'GatewaySG'
@@ -545,6 +559,7 @@ Resources:
       ToPort: 5432
   AdminDatabaseIngress:
     Type: AWS::EC2::SecurityGroupIngress
+    Condition: RunStudio
     Properties:
       GroupId: !Ref 'DatabaseSG'
       SourceSecurityGroupId: !Ref 'AdminSG'
@@ -553,6 +568,7 @@ Resources:
       ToPort: 5432
   AdminDatabaseEgress:
     Type: AWS::EC2::SecurityGroupEgress
+    Condition: RunStudio
     Properties:
       GroupId: !Ref 'AdminSG'
       DestinationSecurityGroupId: !Ref 'DatabaseSG'
@@ -635,6 +651,7 @@ Resources:
     UpdateReplacePolicy: Retain
   MetaSecret:
     Type: AWS::SecretsManager::Secret
+    Condition: RunStudio
     Properties:
       GenerateSecretString:
         SecretStringTemplate: '{}'
@@ -837,6 +854,7 @@ Resources:
                   - !Ref 'ApiSecret'
   AdminExecutionRole:
     Type: AWS::IAM::Role
+    Condition: RunStudio
     Properties:
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
@@ -1896,7 +1914,6 @@ Resources:
     Properties:
       Cluster: !Ref 'Cluster'
       TaskDefinition: !Ref 'GatewayTask'
-      DesiredCount: !Ref 'GatewayMinTasks'
       LaunchType: FARGATE
       PlatformVersion: 1.4.0
       NetworkConfiguration:
@@ -2100,7 +2117,6 @@ Resources:
     Properties:
       Cluster: !Ref 'Cluster'
       TaskDefinition: !Ref 'AuthTask'
-      DesiredCount: !Ref 'AuthMinTasks'
       LaunchType: FARGATE
       PlatformVersion: 1.4.0
       NetworkConfiguration:
@@ -2267,7 +2283,6 @@ Resources:
     Properties:
       Cluster: !Ref 'Cluster'
       TaskDefinition: !Ref 'RestTask'
-      DesiredCount: !Ref 'RestMinTasks'
       LaunchType: FARGATE
       PlatformVersion: 1.4.0
       NetworkConfiguration:
@@ -2440,7 +2455,6 @@ Resources:
     Properties:
       Cluster: !Ref 'Cluster'
       TaskDefinition: !Ref 'StorageTask'
-      DesiredCount: !Ref 'StorageMinTasks'
       LaunchType: FARGATE
       PlatformVersion: 1.4.0
       NetworkConfiguration:

@@ -72,6 +72,8 @@ Studio has privileged database access. Network access is its access-control boun
 
 Studio snippets are ephemeral across task replacement. Store durable schema changes in your own version-controlled migrations rather than relying on Studio's local files.
 
+Fresh deployments with Studio disabled create no administration resources. Disabling an existing installation removes its administration resources from the stack but retains `MetaSecret`; re-enabling generates a new meta encryption key. Review retained secrets separately before removing them when no longer needed.
+
 ## Defaults and boundaries
 
 | Area | Default |
@@ -88,6 +90,7 @@ Studio snippets are ephemeral across task replacement. Store durable schema chan
 | API keys | Opaque publishable/secret keys, ES256 session signing, legacy compatibility keys |
 | Database connections | Separate role passwords; TLS with RDS CA verification |
 | Logs | ECS CloudWatch logging, 30-day retention; gateway omits request URLs/tokens |
+| Task telemetry | Container Insights enabled; set `ContainerInsights=disabled` to omit paid task metrics while retaining service metrics, CPU scaling, and application logs |
 
 Cloud Map avoids a proxy sidecar per application service; clients must handle task replacement and DNS refresh. PostgREST needs a readiness sidecar because its image does not include a shell/HTTP client. Certificate initialization uses the official AWS CLI image to copy the versioned CA bundle into a shared task volume; the probe uses the official Python image. All images are pinned by digest. There are no custom container builds or stack-owned ECR repositories.
 
@@ -96,6 +99,8 @@ This is a deliberately limited RDS integration, not parity with the managed Supa
 New public-schema tables are not automatically granted to API roles. Explicitly grant intended access and enable row-level security. The privileged service role bypasses RLS by design.
 
 Set CPU/memory using valid Fargate combinations. Size service maximums and deployment surge together with RDS connection capacity; horizontal service scaling does not scale RDS. Initial per-replica pools are limited to five connections for Auth, PostgREST, and Storage, but migrations and background work can create additional connections. Retain database headroom. One replica is an explicit availability compromise.
+
+Application Auto Scaling owns core service replica counts, so routine deployments preserve scaled capacity. New services initially start with one task; scalable-target registration raises them to their configured minimum. Verify all minimums are reached before serving traffic. Changing minimum or maximum bounds can adjust current capacity. Container Insights uses a separate performance-log group outside `LogRetentionDays`; disabling collection does not remove existing telemetry.
 
 The stack incurs ongoing charges for RDS, Fargate, ALBs, storage, logs, and optional administration. Existing NAT/endpoints and outbound data incur their own charges. Private VPC traffic between ALBs and services is HTTP; client ingress and database connections use TLS. Add end-to-end service TLS if your requirements demand it.
 
