@@ -33,6 +33,15 @@ This community-maintained project addresses those two core needs: RDS compatibil
 | US-09 | As a maintainer, I want to copy a versioned release of the project's source into a consuming infrastructure repository, so that the organization can review, maintain, and deploy it independently. |
 | US-10 | As an operator, I want to review proposed infrastructure changes and receive clear deployment success or failure, so that changes remain controlled and auditable. |
 
+## Enterprise flexibility (design preference)
+
+Apply these goals selectively where they improve enterprise integration without disproportionate parameters, code, or maintenance effort. They guide future design rather than require universal configurability or a creation/reuse option for every resource. Required security protections and existing shared-infrastructure prerequisites remain in force.
+
+| ID | User story |
+| --- | --- |
+| US-39 | As a platform owner, I want advanced enterprise features with significant security or cost implications to be configurable where useful, so that I can match the deployment to our governance, protection, and budget needs. |
+| US-40 | As an infrastructure engineer, I want to reference resources shared across a product's infrastructure and, where appropriate to the stack's scope, have them created when those inputs are omitted, so that I can avoid duplication and unnecessary provisioning work. |
+
 ## Supabase capabilities and application access
 
 | ID | User story |
