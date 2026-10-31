@@ -177,6 +177,23 @@ class DeploymentTest(unittest.TestCase):
 
 
 class ArtifactTest(unittest.TestCase):
+    def test_service_log_retention_is_opt_in_and_cannot_delete_log_groups(self):
+        template, errors = decode_str(subprocess.check_output([str(ROOT/'src/deploy.sh'), '--template'], text=True, timeout=10))
+        self.assertFalse(errors)
+        self.assertEqual(template['Parameters']['ServiceLogRetentionDays']['Default'], 0)
+        resource = template['Resources']['ServiceLogRetention']
+        self.assertEqual(template['Conditions'][resource['Condition']],
+                         {'Fn::Not': [{'Fn::Equals': [{'Ref': 'ServiceLogRetentionDays'}, 0]}]})
+        statements = template['Resources']['BootstrapRole']['Properties']['Policies'][0]['PolicyDocument']['Statement']
+        condition, policy, absent = next(s['Fn::If'] for s in statements if 'Fn::If' in s)
+        self.assertEqual(condition, resource['Condition'])
+        self.assertEqual(absent, {'Ref': 'AWS::NoValue'})
+        self.assertEqual(set(policy['Action']), {'logs:CreateLogGroup', 'logs:PutRetentionPolicy'})
+        self.assertEqual({r['Fn::Sub'] for r in policy['Resource']}, {
+            'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:'+name+':*'
+            for name in ['/aws/rds/instance/${Database}/postgresql', '/aws/rds/instance/${Database}/upgrade',
+                         '/aws/ecs/containerinsights/${Cluster}/performance']})
+
     def test_private_api_requires_explicit_clients_and_gates_public_ingress(self):
         template, errors = decode_str(subprocess.check_output([str(ROOT/'src/deploy.sh'), '--template'], text=True, timeout=10))
         self.assertFalse(errors)
