@@ -9,7 +9,6 @@ import os
 from pathlib import Path
 import re
 import secrets
-import socket
 import subprocess
 import sys
 import tempfile
@@ -161,8 +160,8 @@ def run(directory, package):
                resource_type='Custom::DatabaseBootstrap', resource_properties=None):
         for _ in range(60):
             try:
-                with socket.create_connection(('127.0.0.1', port), timeout=1):
-                    break
+                request(f'http://127.0.0.1:{port}/', timeout=1)
+                break
             except OSError:
                 time.sleep(1)
         else:
