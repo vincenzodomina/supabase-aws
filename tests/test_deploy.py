@@ -57,7 +57,7 @@ else: sys.exit('Unexpected CLI call: '+repr(args))
 
 
 class DeploymentTest(unittest.TestCase):
-    def run_deploy(self, scenario, apply=False, parameters=None):
+    def run_deploy(self, scenario, apply=False, parameters=None, role_arn=None):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             for tool in ['aws', 'python3']:
@@ -70,6 +70,8 @@ class DeploymentTest(unittest.TestCase):
                     '--parameters', params.name, '--artifacts-bucket', 'artifacts']
             if apply:
                 args.append('--apply')
+            if role_arn is not None:
+                args.extend(['--role-arn', role_arn])
             result = subprocess.run(args, capture_output=True, text=True, cwd=directory,
                                     env=dict(os.environ, PATH=directory+os.pathsep+os.environ['PATH'],
                                              CLI_FIXTURE=directory, SCENARIO=scenario), timeout=30)
@@ -78,12 +80,15 @@ class DeploymentTest(unittest.TestCase):
             return result, calls
 
     def test_plan_uploads_artifacts_without_executing_or_changing_policy(self):
-        result, calls = self.run_deploy('new')
+        role = 'arn:aws:iam::123456789012:role/platform/cloudformation'
+        result, calls = self.run_deploy('new', role_arn=role)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual([c[:3] for c in calls if c[0] == 'aws'], [
             ['aws', 'cloudformation', 'describe-stacks'], ['aws', 's3api', 'put-object'],
             ['aws', 's3api', 'put-object'], ['aws', 'cloudformation', 'deploy']])
         self.assertIn('--no-execute-changeset', calls[-1])
+        self.assertEqual(calls[-1][calls[-1].index('--role-arn')+1], role)
+        self.assertFalse(any('--role-arn' in c for c in calls[:-1]))
         self.assertIn('ArtifactsBucket=artifacts', calls[-1])
         self.assertTrue(any(c.startswith('BootstrapKey=supabase-aws/bootstrap/') for c in calls[-1]))
         self.assertTrue(any(c.startswith('CertificateKey=supabase-aws/certificates/') for c in calls[-1]))
@@ -98,13 +103,16 @@ class DeploymentTest(unittest.TestCase):
         self.assertIn('--s3-bucket', calls[-1])
 
     def test_first_apply_deploys_once_then_protects_database(self):
+        role = 'arn:aws:iam::123456789012:role/platform/cloudformation'
         for scenario in ['new', 'review']:
             with self.subTest(scenario=scenario):
-                result, calls = self.run_deploy(scenario, apply=True)
+                result, calls = self.run_deploy(scenario, apply=True, role_arn=role)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 deployments = [c for c in calls if c[:3] == ['aws', 'cloudformation', 'deploy']]
                 self.assertEqual(len(deployments), 1)
                 self.assertNotIn('--no-execute-changeset', deployments[0])
+                self.assertEqual(deployments[0][deployments[0].index('--role-arn')+1], role)
+                self.assertFalse(any('--role-arn' in c for c in calls if c != deployments[0]))
                 uploads = [i for i, c in enumerate(calls) if c[:3] == ['aws', 's3api', 'put-object']]
                 policy_index = next(i for i, c in enumerate(calls) if c[:3] == ['aws', 'cloudformation', 'set-stack-policy'])
                 self.assertLess(max(uploads), calls.index(deployments[0]))
@@ -120,6 +128,7 @@ class DeploymentTest(unittest.TestCase):
         self.assertEqual(denies['LogicalResourceId/Database'], ['Update:Replace', 'Update:Delete'])
         self.assertEqual(denies['LogicalResourceId/Bucket'], 'Update:Delete')
         deployment = next(c for c in calls if c[:3] == ['aws', 'cloudformation', 'deploy'])
+        self.assertNotIn('--role-arn', deployment)
         self.assertLess(calls.index(policy_call), calls.index(deployment))
 
     def test_access_error_is_not_treated_as_a_new_stack(self):

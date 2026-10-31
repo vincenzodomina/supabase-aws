@@ -45,6 +45,11 @@ Parameters:
     Type: String
     Description: Existing Secrets Manager JSON secret with username and password (SES SMTP credentials).
     AllowedPattern: arn:[^:]+:secretsmanager:[^:]+:[0-9]{12}:secret:.+
+  SesSmtpKmsKeyArn:
+    Type: String
+    Description: Existing customer-managed KMS key for the SMTP secret; empty for the AWS-managed key. Its key policy must permit AuthExecutionRole.
+    Default: ''
+    AllowedPattern: '(^$|arn:[^:]+:kms:[^:]+:[0-9]{12}:key/[a-zA-Z0-9-]+)'
   EnableStudio:
     Type: String
     Description: Create Studio and postgres-meta together, behind an internal HTTPS ALB.
@@ -121,6 +126,13 @@ Parameters:
       - 180
       - 365
     Default: 30
+  ContainerInsights:
+    Type: String
+    Description: Optional paid ECS task telemetry; service metrics and application logs remain available when disabled.
+    AllowedValues:
+      - enabled
+      - disabled
+    Default: enabled
   FileSizeLimitBytes:
     Type: Number
     Description: Maximum Storage upload size.
@@ -242,6 +254,10 @@ Parameters:
     Default: ''
     Description: Optional existing SNS topic ARN for operational alarms.
 Conditions:
+  HasSesSmtpKmsKey: !Not
+    - !Equals
+      - !Ref 'SesSmtpKmsKeyArn'
+      - ''
   RunStudio: !Equals
     - !Ref 'EnableStudio'
     - 'true'
@@ -271,7 +287,7 @@ Resources:
     Properties:
       ClusterSettings:
         - Name: containerInsights
-          Value: enabled
+          Value: !Ref 'ContainerInsights'
   Namespace:
     Type: AWS::ServiceDiscovery::PrivateDnsNamespace
     Properties:
@@ -329,6 +345,7 @@ Resources:
           CidrIp: 0.0.0.0/0
   AdminSG:
     Type: AWS::EC2::SecurityGroup
+    Condition: RunStudio
     Properties:
       GroupDescription: Admin Supabase access
       VpcId: !Ref 'VpcId'
@@ -339,6 +356,7 @@ Resources:
           CidrIp: 0.0.0.0/0
   AdminAlbSG:
     Type: AWS::EC2::SecurityGroup
+    Condition: RunStudio
     Properties:
       GroupDescription: AdminAlb Supabase access
       VpcId: !Ref 'VpcId'
@@ -377,6 +395,7 @@ Resources:
       CidrIp: 0.0.0.0/0
   AdminHttps:
     Type: AWS::EC2::SecurityGroupIngress
+    Condition: RunStudio
     Properties:
       GroupId: !Ref 'AdminAlbSG'
       IpProtocol: tcp
@@ -401,6 +420,7 @@ Resources:
       ToPort: 8000
   AdminUiIngress:
     Type: AWS::EC2::SecurityGroupIngress
+    Condition: RunStudio
     Properties:
       GroupId: !Ref 'AdminSG'
       SourceSecurityGroupId: !Ref 'AdminAlbSG'
@@ -409,6 +429,7 @@ Resources:
       ToPort: 3000
   AdminUiEgress:
     Type: AWS::EC2::SecurityGroupEgress
+    Condition: RunStudio
     Properties:
       GroupId: !Ref 'AdminAlbSG'
       DestinationSecurityGroupId: !Ref 'AdminSG'
@@ -417,6 +438,7 @@ Resources:
       ToPort: 3000
   AdminGatewayIngress:
     Type: AWS::EC2::SecurityGroupIngress
+    Condition: RunStudio
     Properties:
       GroupId: !Ref 'GatewaySG'
       SourceSecurityGroupId: !Ref 'AdminSG'
@@ -425,6 +447,7 @@ Resources:
       ToPort: 8000
   AdminGatewayEgress:
     Type: AWS::EC2::SecurityGroupEgress
+    Condition: RunStudio
     Properties:
       GroupId: !Ref 'AdminSG'
       DestinationSecurityGroupId: !Ref 'GatewaySG'
@@ -545,6 +568,7 @@ Resources:
       ToPort: 5432
   AdminDatabaseIngress:
     Type: AWS::EC2::SecurityGroupIngress
+    Condition: RunStudio
     Properties:
       GroupId: !Ref 'DatabaseSG'
       SourceSecurityGroupId: !Ref 'AdminSG'
@@ -553,6 +577,7 @@ Resources:
       ToPort: 5432
   AdminDatabaseEgress:
     Type: AWS::EC2::SecurityGroupEgress
+    Condition: RunStudio
     Properties:
       GroupId: !Ref 'AdminSG'
       DestinationSecurityGroupId: !Ref 'DatabaseSG'
@@ -635,6 +660,7 @@ Resources:
     UpdateReplacePolicy: Retain
   MetaSecret:
     Type: AWS::SecretsManager::Secret
+    Condition: RunStudio
     Properties:
       GenerateSecretString:
         SecretStringTemplate: '{}'
@@ -693,6 +719,12 @@ Resources:
               SSEAlgorithm: AES256
       VersioningConfiguration:
         Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: AbortIncompleteUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
       OwnershipControls:
         Rules:
           - ObjectOwnership: BucketOwnerEnforced
@@ -705,6 +737,8 @@ Resources:
     UpdateReplacePolicy: Retain
   BucketPolicy:
     Type: AWS::S3::BucketPolicy
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       Bucket: !Ref 'Bucket'
       PolicyDocument:
@@ -773,6 +807,18 @@ Resources:
                   - !Ref 'AuthSecret'
                   - !Ref 'ApiSecret'
                   - !Ref 'SesSmtpSecretArn'
+              - !If
+                - HasSesSmtpKmsKey
+                - Effect: Allow
+                  Action: kms:Decrypt
+                  Resource: !Ref 'SesSmtpKmsKeyArn'
+                  Condition:
+                    StringEquals:
+                      kms:ViaService: !Sub
+                        - 'secretsmanager.${SecretRegion}.${AWS::URLSuffix}'
+                        - SecretRegion: !Select [3, !Split [':', !Ref 'SesSmtpSecretArn']]
+                      kms:EncryptionContext:SecretARN: !Ref 'SesSmtpSecretArn'
+                - !Ref 'AWS::NoValue'
   RestExecutionRole:
     Type: AWS::IAM::Role
     Properties:
@@ -829,6 +875,7 @@ Resources:
                   - !Ref 'ApiSecret'
   AdminExecutionRole:
     Type: AWS::IAM::Role
+    Condition: RunStudio
     Properties:
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
@@ -1888,7 +1935,6 @@ Resources:
     Properties:
       Cluster: !Ref 'Cluster'
       TaskDefinition: !Ref 'GatewayTask'
-      DesiredCount: !Ref 'GatewayMinTasks'
       LaunchType: FARGATE
       PlatformVersion: 1.4.0
       NetworkConfiguration:
@@ -2092,7 +2138,6 @@ Resources:
     Properties:
       Cluster: !Ref 'Cluster'
       TaskDefinition: !Ref 'AuthTask'
-      DesiredCount: !Ref 'AuthMinTasks'
       LaunchType: FARGATE
       PlatformVersion: 1.4.0
       NetworkConfiguration:
@@ -2259,7 +2304,6 @@ Resources:
     Properties:
       Cluster: !Ref 'Cluster'
       TaskDefinition: !Ref 'RestTask'
-      DesiredCount: !Ref 'RestMinTasks'
       LaunchType: FARGATE
       PlatformVersion: 1.4.0
       NetworkConfiguration:
@@ -2432,7 +2476,6 @@ Resources:
     Properties:
       Cluster: !Ref 'Cluster'
       TaskDefinition: !Ref 'StorageTask'
-      DesiredCount: !Ref 'StorageMinTasks'
       LaunchType: FARGATE
       PlatformVersion: 1.4.0
       NetworkConfiguration:
