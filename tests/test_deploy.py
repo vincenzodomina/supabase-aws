@@ -177,6 +177,27 @@ class DeploymentTest(unittest.TestCase):
 
 
 class ArtifactTest(unittest.TestCase):
+    def test_private_api_requires_explicit_clients_and_gates_public_ingress(self):
+        template, errors = decode_str(subprocess.check_output([str(ROOT/'src/deploy.sh'), '--template'], text=True, timeout=10))
+        self.assertFalse(errors)
+        resources = template['Resources']
+        self.assertEqual(template['Parameters']['ApiExposure']['Default'], 'internal')
+        self.assertEqual(resources['ApiAlb']['Properties']['Scheme'], {'Ref': 'ApiExposure'})
+        public_condition = resources['PublicHttps']['Condition']
+        self.assertEqual(template['Conditions'][public_condition], {'Fn::Equals': [{'Ref': 'ApiExposure'}, 'internet-facing']})
+        self.assertEqual(resources['ApiAlb']['Properties']['Subnets'],
+                         {'Fn::If': [public_condition, {'Ref': 'PublicSubnetIds'}, {'Ref': 'PrivateSubnetIds'}]})
+        private = resources['PrivateApiHttps']
+        self.assertEqual(template['Conditions'][private['Condition']], {'Fn::Equals': [{'Ref': 'ApiExposure'}, 'internal']})
+        self.assertEqual(private['Properties']['SourceSecurityGroupId'], {'Ref': 'ApiClientSecurityGroupId'})
+        self.assertNotIn('CidrIp', private['Properties'])
+        rule = template['Rules']['PrivateApiRequiresClients']
+        self.assertEqual(rule['RuleCondition'], template['Conditions'][private['Condition']])
+        self.assertEqual(rule['Assertions'][0]['Assert'], {'Fn::Not': [{'Fn::Equals': [{'Ref': 'ApiClientSecurityGroupId'}, '']}]})
+        public_rule = template['Rules']['PublicApiRequiresSubnets']
+        self.assertEqual(public_rule['RuleCondition'], template['Conditions'][public_condition])
+        self.assertEqual(public_rule['Assertions'][0]['Assert'], {'Fn::Not': [{'Fn::Contains': [{'Ref': 'PublicSubnetIds'}, '']}]})
+
     def test_rendered_template_and_all_tasks_fit_size_budgets(self):
         rendered = subprocess.check_output([str(ROOT/'src/deploy.sh'), '--template'], timeout=10)
         self.assertLess(len(rendered), 1024*1024)

@@ -5,8 +5,10 @@ Parameters:
     Type: AWS::EC2::VPC::Id
     Description: Existing VPC with DNS support and hostnames enabled.
   PublicSubnetIds:
-    Type: List<AWS::EC2::Subnet::Id>
-    Description: Two public subnets in distinct AZs for the API load balancer.
+    Type: CommaDelimitedList
+    Description: Two public subnets in distinct AZs; required only for internet-facing API access.
+    Default: ''
+    AllowedPattern: '(^$|subnet-([0-9a-f]{8}|[0-9a-f]{17}))'
   PrivateSubnetIds:
     Type: List<AWS::EC2::Subnet::Id>
     Description: Two private subnets in distinct AZs with outbound HTTPS/SES SMTP access.
@@ -21,9 +23,21 @@ Parameters:
     Type: String
     Description: API DNS hostname; point it at ApiLoadBalancerDnsName.
     AllowedPattern: '[a-z0-9][a-z0-9.-]+\.[a-z]{2,}'
+  ApiExposure:
+    Type: String
+    Description: Internal API for private clients, or explicitly internet-facing. Changing this replaces the API load balancer.
+    AllowedValues:
+      - internal
+      - internet-facing
+    Default: internal
+  ApiClientSecurityGroupId:
+    Type: String
+    Description: Existing application/client security group in the VPC allowed HTTPS access to the internal API.
+    Default: ''
+    AllowedPattern: '(^$|sg-([0-9a-f]{8}|[0-9a-f]{17}))'
   HostedZoneId:
     Type: String
-    Description: Optional existing public Route 53 zone; empty means manage DNS yourself.
+    Description: Existing Route 53 zone; use a VPC-associated private zone for internal access. Empty means manage DNS yourself.
     Default: ''
   SiteUrl:
     Type: String
@@ -254,6 +268,8 @@ Parameters:
     Default: ''
     Description: Optional existing SNS topic ARN for operational alarms.
 Conditions:
+  PublicApi: !Equals [!Ref 'ApiExposure', internet-facing]
+  PrivateApi: !Equals [!Ref 'ApiExposure', internal]
   HasSesSmtpKmsKey: !Not
     - !Equals
       - !Ref 'SesSmtpKmsKeyArn'
@@ -387,12 +403,27 @@ Resources:
           CidrIp: 0.0.0.0/0
   PublicHttps:
     Type: AWS::EC2::SecurityGroupIngress
+    Condition: PublicApi
     Properties:
       GroupId: !Ref 'ApiAlbSG'
       IpProtocol: tcp
       FromPort: 443
       ToPort: 443
       CidrIp: 0.0.0.0/0
+  PrivateApiHttps:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: PrivateApi
+    # Rules reject the empty optional ID before this resource is created.
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks: [W1030]
+    Properties:
+      GroupId: !Ref 'ApiAlbSG'
+      SourceSecurityGroupId: !Ref 'ApiClientSecurityGroupId'
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
   AdminHttps:
     Type: AWS::EC2::SecurityGroupIngress
     Condition: RunStudio
@@ -2524,10 +2555,15 @@ Resources:
           PredefinedMetricType: ECSServiceAverageCPUUtilization
   ApiAlb:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    # Rules require public subnet IDs only for internet-facing access.
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks: [W1030]
     Properties:
-      Scheme: internet-facing
+      Scheme: !Ref 'ApiExposure'
       Type: application
-      Subnets: !Ref 'PublicSubnetIds'
+      Subnets: !If [PublicApi, !Ref 'PublicSubnetIds', !Ref 'PrivateSubnetIds']
       SecurityGroups:
         - !Ref 'ApiAlbSG'
       LoadBalancerAttributes:
@@ -2868,6 +2904,17 @@ Outputs:
     Value: !GetAtt 'AdminAlb.DNSName'
     Condition: RunStudio
 Rules:
+  PrivateApiRequiresClients:
+    RuleCondition: !Equals [!Ref 'ApiExposure', internal]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref 'ApiClientSecurityGroupId', '']]
+        AssertDescription: Provide ApiClientSecurityGroupId for internal API access.
+  PublicApiRequiresSubnets:
+    RuleCondition: !Equals [!Ref 'ApiExposure', internet-facing]
+    Assertions:
+      - Assert: !Not
+          - Fn::Contains: [!Ref 'PublicSubnetIds', '']
+        AssertDescription: Provide public subnets in two Availability Zones for internet-facing API access.
   StudioRequiresHostname:
     RuleCondition: !Equals
       - !Ref 'EnableStudio'

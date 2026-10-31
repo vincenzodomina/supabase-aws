@@ -8,7 +8,7 @@ The stack runs Envoy, Auth, PostgREST, and S3-backed Storage as separate ECS ser
 
 ```mermaid
 flowchart TD
-    Clients[API clients] --> ALB[Public HTTPS ALB]
+    Clients[Allowed application clients] --> ALB[HTTPS ALB: internal by default]
     subgraph VPC[Existing VPC]
       ALB --> Envoy[Envoy ECS service]
       subgraph Private[Private subnets]
@@ -33,7 +33,7 @@ flowchart TD
 ## Requirements
 
 - An AWS account and permission to deploy CloudFormation, IAM, ECS, RDS, S3, Cloud Map, Lambda, CloudWatch, and load balancers.
-- An existing VPC with DNS support/hostnames enabled, two public subnets, two private application subnets, and private database subnets spanning at least two Availability Zones. Application and database subnets may overlap.
+- An existing VPC with DNS support/hostnames enabled, two private application subnets, and private database subnets spanning at least two Availability Zones. Application and database subnets may overlap. The default internal API requires an existing client security group in this VPC. Internet-facing access additionally requires two public subnets.
 - Shared outbound connectivity from application subnets as listed below. The stack does not create NAT gateways or VPC endpoints.
 - An existing ACM certificate in the deployment region covering the API hostname and, if enabled, the Studio hostname.
 - An existing private S3 bucket in the deployment region for templates, Lambda ZIPs, and the RDS CA bundle. The deployer needs `s3:PutObject`/`s3:GetObject`; certificate readers receive access to only their CA object. Uploads use SSE-S3 encryption. Retain artifacts while referenced by current or rollback deployments; task replacements still download the CA bundle.
@@ -74,7 +74,11 @@ The deployer installs a CloudFormation stack policy blocking database replacemen
 
 Envoy uses its pinned official image. `src/deploy.sh` embeds `src/gateway-entrypoint.sh` into the template before upload; the `@include` marker is local packaging syntax, not a CloudFormation feature. Use `./src/deploy.sh --template > rendered.yaml` to produce the deployable template for review or another pipeline (with its S3 artifact parameters), without AWS credentials. Gateway configuration lives in `src/supabase.yaml`, and secrets are injected by ECS at task launch.
 
-If `HostedZoneId` is supplied, the stack creates the API alias in that existing zone. Otherwise point `ApiDomainName` at the `ApiLoadBalancerDnsName` output yourself. DNS must match the supplied certificate. The API is HTTPS-only.
+The API defaults to `ApiExposure=internal`, using the private application subnets. Set `ApiClientSecurityGroupId` to the existing security group of the consuming ECS application or other approved clients; those clients also need outbound HTTPS access. Browsers and Auth email-link users must have private network access to this endpoint. For public clients, explicitly choose `ApiExposure=internet-facing` and provide `PublicSubnetIds`.
+
+If `HostedZoneId` is supplied, the stack creates the API alias in that existing zone: use a private zone associated with the VPC for internal access, or a public zone for internet-facing access. Otherwise manage the corresponding DNS yourself, pointing `ApiDomainName` at `ApiLoadBalancerDnsName`. DNS must match the supplied certificate. The API is HTTPS-only.
+
+Existing public deployments must explicitly set `ApiExposure=internet-facing` to preserve their exposure. Changing the scheme replaces the ALB and updates its DNS target; review the change set and plan a client/DNS cutover before switching an existing deployment.
 
 `ApiSecretArn` identifies the generated API credentials. Retrieve only `SUPABASE_PUBLISHABLE_KEY` for clients; keep `SUPABASE_SECRET_KEY`, legacy service-role keys, and signing keys on trusted servers. The stack never returns secret values through outputs.
 
@@ -94,6 +98,7 @@ Fresh deployments with Studio disabled create no administration resources. Disab
 | --- | --- |
 | Supabase release | `self-hosted/v0.8.3`; immutable images declared in `src/supabase.yaml` |
 | Runtime | Linux x86-64 Fargate, private task IPs |
+| API exposure | Internal HTTPS ALB, restricted to an existing client security group; public access is opt-in |
 | Discovery | Cloud Map private DNS; Envoy refreshes service addresses |
 | API services | Two replicas each; CPU target tracking, maximum four each |
 | Administration | Disabled; one combined task when enabled |

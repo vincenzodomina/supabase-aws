@@ -1,10 +1,11 @@
 {
   "VpcId": "vpc-0123456789abcdef0",
-  "PublicSubnetIds": "subnet-11111111111111111,subnet-22222222222222222",
   "PrivateSubnetIds": "subnet-33333333333333333,subnet-44444444444444444",
   "DatabaseSubnetIds": "subnet-33333333333333333,subnet-44444444444444444",
   "CertificateArn": "arn:aws:acm:us-east-1:123456789012:certificate/00000000-0000-0000-0000-000000000000",
   "ApiDomainName": "supabase.example.com",
+  "ApiExposure": "internal",
+  "ApiClientSecurityGroupId": "sg-0123456789abcdef0",
   "SiteUrl": "https://app.example.com",
   "AdditionalRedirectUrls": "https://app.example.com/auth/callback",
   "SesRegion": "us-east-1",
