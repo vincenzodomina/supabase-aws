@@ -56,7 +56,11 @@ def start(name, image, environment, port=None, alias=None, mounts=(), entrypoint
     for key in environment:
         args += ['--env', key]
     containers.append(name)
-    docker(*args, image, *command, env=dict(os.environ, **environment))
+    try:
+        docker(*args, image, *command, env=dict(os.environ, **environment))
+    except subprocess.CalledProcessError as error:
+        error.add_note(error.stderr or 'Docker returned no startup diagnostics.')
+        raise
     if port:
         return int(docker('port', name, str(port)).rsplit(':', 1)[1])
 
