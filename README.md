@@ -72,6 +72,15 @@ The Bash deployer uploads artifacts under content-addressed S3 keys and passes `
 
 The deployer installs a CloudFormation stack policy blocking database replacement/removal, preserving existing restrictions. It applies the policy before updates and immediately after successful first creation. Stack policies are an API setting, not a template resource; database deletion protection and snapshot policies are declared in the YAML. `--apply` creates and executes a fresh change set from the current files. Review changes before applying; an ECS rollback does not reverse database migrations.
 
+To execute an already reviewed plan, record its full change-set ARN from the CLI output or CloudFormation console, then run:
+
+```sh
+./src/deploy.sh --stack-name supabase-demo --region us-east-1 --profile personal \
+  --change-set "$CHANGE_SET_ARN" --apply
+```
+
+This mode verifies the stack identity and plan availability, applies database protection, executes that exact change set, and waits for completion. It does not repackage or upload files, or accept parameter, artifact-bucket, or role overrides; those inputs belong to the reviewed plan. Keep its referenced S3 artifacts available. It needs only AWS CLI, Bash, and `jq`. Both initial creation and updates are supported; obsolete or failed plans must be reviewed again as new change sets.
+
 Envoy uses its pinned official image. `src/deploy.sh` embeds `src/gateway-entrypoint.sh` into the template before upload; the `@include` marker is local packaging syntax, not a CloudFormation feature. Use `./src/deploy.sh --template > rendered.yaml` to produce the deployable template for review or another pipeline (with its S3 artifact parameters), without AWS credentials. Gateway configuration lives in `src/supabase.yaml`, and secrets are injected by ECS at task launch.
 
 The API defaults to `ApiExposure=internal`, using the private application subnets. Set `ApiClientSecurityGroupId` to the existing security group of the consuming ECS application or other approved clients; those clients also need outbound HTTPS access. Browsers and Auth email-link users must have private network access to this endpoint. For public clients, explicitly choose `ApiExposure=internet-facing` and provide `PublicSubnetIds`.

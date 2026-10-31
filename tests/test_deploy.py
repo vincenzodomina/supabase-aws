@@ -35,7 +35,18 @@ if command == ['cloudformation', 'describe-stacks']:
     if scenario in ['new', 'deploy-fails'] and not (root/'created').exists():
         sys.exit('ValidationError: Stack with id demo does not exist')
     status = 'REVIEW_IN_PROGRESS' if scenario == 'review' else 'CREATE_COMPLETE'
-    print(json.dumps({'Stacks': [{'StackStatus': status}]}))
+    print(json.dumps({'Stacks': [{'StackStatus': status, 'StackId': 'arn:aws:cloudformation:us-east-1:123456789012:stack/demo/original'}]}))
+elif command == ['cloudformation', 'describe-change-set']:
+    if scenario == 'change-set-denied': sys.exit('AccessDenied: cannot read change set')
+    print(json.dumps({
+        'StackId': 'wrong-stack' if scenario == 'wrong-stack' else 'arn:aws:cloudformation:us-east-1:123456789012:stack/demo/original',
+        'ChangeSetId': 'wrong-set' if scenario == 'wrong-set' else args[args.index('--change-set-name')+1],
+        'Status': 'FAILED' if scenario == 'failed-set' else 'CREATE_COMPLETE',
+        'ExecutionStatus': 'OBSOLETE' if scenario == 'obsolete-set' else 'AVAILABLE'}))
+elif command == ['cloudformation', 'execute-change-set']:
+    if scenario == 'execute-fails': sys.exit('Change set execution failed')
+elif command == ['cloudformation', 'wait']:
+    if scenario == 'wait-fails': sys.exit('Waiter failed: UPDATE_ROLLBACK_COMPLETE')
 elif command == ['cloudformation', 'deploy']:
     if scenario == 'deploy-fails': sys.exit('CloudFormation deployment failed')
     (root/'template').write_text(pathlib.Path(args[args.index('--template-file')+1]).read_text())
@@ -57,7 +68,7 @@ else: sys.exit('Unexpected CLI call: '+repr(args))
 
 
 class DeploymentTest(unittest.TestCase):
-    def run_deploy(self, scenario, apply=False, parameters=None, role_arn=None):
+    def run_deploy(self, scenario, apply=False, parameters=None, role_arn=None, change_set=None, extra_args=()):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             for tool in ['aws', 'python3']:
@@ -66,8 +77,12 @@ class DeploymentTest(unittest.TestCase):
                 path.chmod(0o755)
             params = root/'parameters.json'
             params.write_text(json.dumps(parameters if parameters is not None else {'SiteUrl': 'https://example.com/a b'}))
-            args = ['bash', str(ROOT/'src/deploy.sh'), '--stack-name', 'demo', '--region', 'us-east-1',
-                    '--parameters', params.name, '--artifacts-bucket', 'artifacts']
+            args = ['bash', str(ROOT/'src/deploy.sh'), '--stack-name', 'demo', '--region', 'us-east-1']
+            if change_set is None:
+                args.extend(['--parameters', params.name, '--artifacts-bucket', 'artifacts'])
+            else:
+                args.extend(['--change-set', change_set])
+            args.extend(extra_args)
             if apply:
                 args.append('--apply')
             if role_arn is not None:
@@ -174,6 +189,56 @@ class DeploymentTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             keys.append(next(c for c in calls[-1] if c.startswith('BootstrapKey=')))
         self.assertEqual(keys[0], keys[1])
+
+    def test_reviewed_change_set_executes_without_repackaging_and_preserves_protection_order(self):
+        arn = 'arn:aws:cloudformation:us-east-1:123456789012:changeSet/reviewed/immutable-id'
+        for scenario, waiter in [('cached', 'stack-update-complete'), ('review', 'stack-create-complete')]:
+            with self.subTest(scenario=scenario):
+                result, calls = self.run_deploy(scenario, apply=True, change_set=arn)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                commands = [c[1:3] for c in calls]
+                protection = [['cloudformation', 'get-stack-policy'], ['cloudformation', 'set-stack-policy']]
+                execution = [['cloudformation', 'execute-change-set'], ['cloudformation', 'wait']]
+                self.assertEqual(commands, [['cloudformation', 'describe-stacks'], ['cloudformation', 'describe-change-set']] +
+                                 (protection+execution if scenario == 'cached' else execution+protection))
+                execute = next(c for c in calls if c[1:3] == execution[0])
+                self.assertEqual(execute[execute.index('--change-set-name')+1], arn)
+                for call in calls[1:]:
+                    self.assertEqual(call[call.index('--stack-name')+1], 'arn:aws:cloudformation:us-east-1:123456789012:stack/demo/original')
+                wait = next(c for c in calls if c[1:3] == execution[1])
+                self.assertEqual(wait[3], waiter)
+                self.assertIn('Stack deployment complete', result.stdout)
+
+    def test_unavailable_or_wrong_reviewed_plan_cannot_mutate_the_stack(self):
+        arn = 'arn:aws:cloudformation:us-east-1:123456789012:changeSet/reviewed/immutable-id'
+        for scenario in ['new', 'wrong-stack', 'wrong-set', 'failed-set', 'obsolete-set', 'change-set-denied']:
+            with self.subTest(scenario=scenario):
+                result, calls = self.run_deploy(scenario, apply=True, change_set=arn)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertTrue(all(c[1:3] in [['cloudformation', 'describe-stacks'], ['cloudformation', 'describe-change-set']] for c in calls))
+
+    def test_reviewed_execution_failures_never_report_success(self):
+        arn = 'arn:aws:cloudformation:us-east-1:123456789012:changeSet/reviewed/immutable-id'
+        for scenario in ['policy-read-denied', 'policy-write-denied', 'execute-fails', 'wait-fails']:
+            with self.subTest(scenario=scenario):
+                result, calls = self.run_deploy(scenario, apply=True, change_set=arn)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn('Stack deployment complete', result.stdout)
+                if scenario.startswith('policy-'):
+                    self.assertFalse(any(c[1:3] == ['cloudformation', 'execute-change-set'] for c in calls))
+                if scenario == 'execute-fails':
+                    self.assertFalse(any(c[1:3] == ['cloudformation', 'wait'] for c in calls))
+
+    def test_reviewed_execution_rejects_names_and_input_overrides_before_external_calls(self):
+        arn = 'arn:aws:cloudformation:us-east-1:123456789012:changeSet/reviewed/immutable-id'
+        for change_set, apply, extra in [('reusable-name', True, []), (arn, False, []),
+                                         (arn, True, ['--parameters', 'unread.json']),
+                                         (arn, True, ['--artifacts-bucket', 'other']),
+                                         (arn, True, ['--role-arn', 'other'])]:
+            with self.subTest(change_set=change_set, apply=apply, extra=extra):
+                result, calls = self.run_deploy('cached', apply=apply, change_set=change_set, extra_args=extra)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(calls, [])
 
 
 class ArtifactTest(unittest.TestCase):

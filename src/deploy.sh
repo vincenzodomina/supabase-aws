@@ -5,6 +5,7 @@
 # ┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫
 # ┃  One CloudFormation stack; no custom container builds.             ┃
 # ┃  Default: create a change set. Use --apply to execute.              ┃
+# ┃  --change-set ARN --apply executes an existing reviewed plan.       ┃
 # ┃                                                                    ┃
 # ┃  1. Parse Options and Check Required Tools                          ┃
 # ┃  2. Load Parameters and Embed the Gateway Script                    ┃
@@ -23,6 +24,7 @@ project_dir=$(cd "$(dirname "$0")/.." && pwd)
 
 usage() {
   echo "Usage: $0 --stack-name NAME --region REGION --parameters FILE --artifacts-bucket BUCKET [--profile PROFILE] [--role-arn ARN] [--apply]"
+  echo "       $0 --stack-name NAME --region REGION --change-set ARN --apply [--profile PROFILE]"
   echo "       $0 --template > rendered.yaml"
   echo "       $0 --package bootstrap.zip"
 }
@@ -74,7 +76,7 @@ if [[ $# -eq 2 && "$1" == --package ]]; then
 fi
 
 apply=false
-stack_name='' region='' parameters='' artifacts_bucket='' role_arn=''
+stack_name='' stack_id='' region='' parameters='' artifacts_bucket='' role_arn='' change_set=''
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --stack-name) stack_name="${2:?Missing stack name}"; shift 2 ;;
@@ -83,31 +85,47 @@ while [[ $# -gt 0 ]]; do
     --artifacts-bucket) artifacts_bucket="${2:?Missing artifact bucket}"; shift 2 ;;
     --profile) export AWS_PROFILE="${2:?Missing profile}"; shift 2 ;;
     --role-arn) role_arn="${2:?Missing CloudFormation role ARN}"; shift 2 ;;
+    --change-set) change_set="${2:?Missing change-set ARN}"; shift 2 ;;
     --apply) apply=true; shift ;;
     --help|-h) usage; exit 0 ;;
     *) usage >&2; exit 1 ;;
   esac
 done
-[[ -n "$stack_name" && -n "$region" && -n "$parameters" && -n "$artifacts_bucket" ]] || { usage >&2; exit 1; }
+[[ -n "$stack_name" && -n "$region" ]] || { usage >&2; exit 1; }
+required_tools=(aws jq)
+if [[ -n "$change_set" ]]; then
+  if ! "$apply" || [[ -n "$parameters" || -n "$artifacts_bucket" || -n "$role_arn" ]]; then
+    echo '--change-set requires --apply and cannot be combined with parameters, artifacts, or a role override.' >&2
+    exit 1
+  fi
+  [[ "$change_set" =~ ^arn:[^:]+:cloudformation:[^:]+:[0-9]{12}:changeSet/[^/]+/[^/]+$ ]] || {
+    echo 'Use the full reviewed change-set ARN, not a reusable name.' >&2; exit 1;
+  }
+else
+  [[ -n "$parameters" && -n "$artifacts_bucket" ]] || { usage >&2; exit 1; }
+  required_tools+=(openssl python3 zip)
+fi
 [[ "$stack_name" =~ ^[a-z][a-z0-9-]{0,39}$ ]] || { echo 'Use a lowercase stack name of at most 40 characters.' >&2; exit 1; }
 export AWS_REGION="$region" AWS_DEFAULT_REGION="$region" AWS_PAGER='' AWS_CLI_AUTO_PROMPT=off
-for tool in aws jq openssl python3 zip; do
+for tool in "${required_tools[@]}"; do
   command -v "$tool" >/dev/null || { echo "Missing tool: $tool" >&2; exit 1; }
 done
 
 ########## 2. Load Parameters and Embed the Gateway Script ##########
 
-if ! jq -e 'type == "object" and (has("ArtifactsBucket") | not) and (has("BootstrapKey") | not) and (has("CertificateKey") | not)
-  and all(.[]; (type == "string" or type == "number" or type == "boolean") and (tostring | test("[\\r\\n]") | not))' "$parameters" >/dev/null; then
-  echo 'Parameters must be a JSON object of single-line values. ArtifactsBucket, BootstrapKey, and CertificateKey are managed by deploy.sh.' >&2
-  exit 1
-fi
-overrides=()
-while IFS= read -r value; do overrides+=("$value"); done < <(jq -r 'to_entries[] | "\(.key)=\(.value)"' "$parameters")
-cd "$project_dir"
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
-render_template > "$scratch/supabase.yaml"
+if [[ -z "$change_set" ]]; then
+  if ! jq -e 'type == "object" and (has("ArtifactsBucket") | not) and (has("BootstrapKey") | not) and (has("CertificateKey") | not)
+    and all(.[]; (type == "string" or type == "number" or type == "boolean") and (tostring | test("[\\r\\n]") | not))' "$parameters" >/dev/null; then
+    echo 'Parameters must be a JSON object of single-line values. ArtifactsBucket, BootstrapKey, and CertificateKey are managed by deploy.sh.' >&2
+    exit 1
+  fi
+  overrides=()
+  while IFS= read -r value; do overrides+=("$value"); done < <(jq -r 'to_entries[] | "\(.key)=\(.value)"' "$parameters")
+  cd "$project_dir"
+  render_template > "$scratch/supabase.yaml"
+fi
 
 ########## 3. Inspect the Existing Stack ##########
 
@@ -119,39 +137,51 @@ else
   cat "$scratch/error" >&2
   exit 1
 fi
+if [[ -n "$change_set" ]]; then
+  [[ "$status" != NEW ]] || { echo 'The reviewed stack no longer exists.' >&2; exit 1; }
+  stack_id=$(jq -er '.Stacks[0].StackId' <<<"$stack")
+  reviewed=$(aws cloudformation describe-change-set --change-set-name "$change_set" --stack-name "$stack_id" --output json)
+  if ! jq -e --arg stack "$stack_id" --arg arn "$change_set" \
+    '.StackId == $stack and .ChangeSetId == $arn and .Status == "CREATE_COMPLETE" and .ExecutionStatus == "AVAILABLE"' <<<"$reviewed" >/dev/null; then
+    echo 'The change set must belong to this stack and be available for execution.' >&2
+    exit 1
+  fi
+fi
 
 ########## 4. Package and Upload Versioned Lambda and Certificate Artifacts ##########
 
-package_lambda "$scratch/bootstrap.zip"
-bootstrap_key="supabase-aws/bootstrap/$(openssl dgst -sha256 -r "$scratch/bootstrap.zip" | cut -d' ' -f1).zip"
-certificate_key="supabase-aws/certificates/$(openssl dgst -sha256 -r src/rds-ca.pem | cut -d' ' -f1).pem"
+if [[ -z "$change_set" ]]; then
+  package_lambda "$scratch/bootstrap.zip"
+  bootstrap_key="supabase-aws/bootstrap/$(openssl dgst -sha256 -r "$scratch/bootstrap.zip" | cut -d' ' -f1).zip"
+  certificate_key="supabase-aws/certificates/$(openssl dgst -sha256 -r src/rds-ca.pem | cut -d' ' -f1).pem"
 
-upload_artifact() {
-  if aws s3api put-object --bucket "$artifacts_bucket" --key "$2" --body "$1" \
-    --server-side-encryption AES256 --if-none-match '*' > /dev/null 2>"$scratch/error"; then
-    echo "Published artifact: $2"
-  elif [[ $(<"$scratch/error") == *PreconditionFailed* ]]; then
-    echo "Reusing artifact: $2"
-  else
-    cat "$scratch/error" >&2
-    return 1
-  fi
-}
-upload_artifact "$scratch/bootstrap.zip" "$bootstrap_key"
-upload_artifact src/rds-ca.pem "$certificate_key"
-overrides+=("ArtifactsBucket=$artifacts_bucket" "BootstrapKey=$bootstrap_key" "CertificateKey=$certificate_key")
+  upload_artifact() {
+    if aws s3api put-object --bucket "$artifacts_bucket" --key "$2" --body "$1" \
+      --server-side-encryption AES256 --if-none-match '*' > /dev/null 2>"$scratch/error"; then
+      echo "Published artifact: $2"
+    elif [[ $(<"$scratch/error") == *PreconditionFailed* ]]; then
+      echo "Reusing artifact: $2"
+    else
+      cat "$scratch/error" >&2
+      return 1
+    fi
+  }
+  upload_artifact "$scratch/bootstrap.zip" "$bootstrap_key"
+  upload_artifact src/rds-ca.pem "$certificate_key"
+  overrides+=("ArtifactsBucket=$artifacts_bucket" "BootstrapKey=$bootstrap_key" "CertificateKey=$certificate_key")
+fi
 
 ########## 5. Protect the Existing Database ##########
 
 protect_database() {
   local policy
   # Preserve any additional restrictions while blocking destructive database updates.
-  policy=$(aws cloudformation get-stack-policy --stack-name "$stack_name" --output json)
+  policy=$(aws cloudformation get-stack-policy --stack-name "${stack_id:-$stack_name}" --output json)
   policy=$(jq -c '(.StackPolicyBody | if . then fromjson else
     {Statement: [{Effect:"Allow", Action:"Update:*", Principal:"*", Resource:"*"}]} end)
     | .Statement += [{Effect:"Deny", Action:["Update:Replace","Update:Delete"], Principal:"*", Resource:"LogicalResourceId/Database"}]
     | .Statement |= unique' <<<"$policy")
-  aws cloudformation set-stack-policy --stack-name "$stack_name" --stack-policy-body "$policy"
+  aws cloudformation set-stack-policy --stack-name "${stack_id:-$stack_name}" --stack-policy-body "$policy"
 }
 new_stack=false
 if [[ "$status" == NEW || "$status" == REVIEW_IN_PROGRESS ]]; then new_stack=true; fi
@@ -159,12 +189,19 @@ if "$apply" && ! "$new_stack"; then protect_database; fi
 
 ########## 6. Deploy the Stack and Protect a Newly Created Database ##########
 
-options=(--no-fail-on-empty-changeset)
-if [[ -n "$role_arn" ]]; then options+=(--role-arn "$role_arn"); fi
-if ! "$apply"; then options+=(--no-execute-changeset); fi
-aws cloudformation deploy --stack-name "$stack_name" --template-file "$scratch/supabase.yaml" \
-  --s3-bucket "$artifacts_bucket" --s3-prefix "supabase-aws/$stack_name" \
-  --capabilities CAPABILITY_IAM --parameter-overrides "${overrides[@]}" "${options[@]}"
+if [[ -n "$change_set" ]]; then
+  aws cloudformation execute-change-set --change-set-name "$change_set" --stack-name "$stack_id"
+  waiter='stack-update-complete'
+  if "$new_stack"; then waiter='stack-create-complete'; fi
+  aws cloudformation wait "$waiter" --stack-name "$stack_id"
+else
+  options=(--no-fail-on-empty-changeset)
+  if [[ -n "$role_arn" ]]; then options+=(--role-arn "$role_arn"); fi
+  if ! "$apply"; then options+=(--no-execute-changeset); fi
+  aws cloudformation deploy --stack-name "$stack_name" --template-file "$scratch/supabase.yaml" \
+    --s3-bucket "$artifacts_bucket" --s3-prefix "supabase-aws/$stack_name" \
+    --capabilities CAPABILITY_IAM --parameter-overrides "${overrides[@]}" "${options[@]}"
+fi
 if "$apply"; then
   if "$new_stack"; then protect_database; fi
   echo 'Stack deployment complete. Run the README acceptance checks before serving users.'
