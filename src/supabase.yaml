@@ -45,6 +45,11 @@ Parameters:
     Type: String
     Description: Existing Secrets Manager JSON secret with username and password (SES SMTP credentials).
     AllowedPattern: arn:[^:]+:secretsmanager:[^:]+:[0-9]{12}:secret:.+
+  SesSmtpKmsKeyArn:
+    Type: String
+    Description: Existing customer-managed KMS key for the SMTP secret; empty for the AWS-managed key. Its key policy must permit AuthExecutionRole.
+    Default: ''
+    AllowedPattern: '(^$|arn:[^:]+:kms:[^:]+:[0-9]{12}:key/[a-zA-Z0-9-]+)'
   EnableStudio:
     Type: String
     Description: Create Studio and postgres-meta together, behind an internal HTTPS ALB.
@@ -249,6 +254,10 @@ Parameters:
     Default: ''
     Description: Optional existing SNS topic ARN for operational alarms.
 Conditions:
+  HasSesSmtpKmsKey: !Not
+    - !Equals
+      - !Ref 'SesSmtpKmsKeyArn'
+      - ''
   RunStudio: !Equals
     - !Ref 'EnableStudio'
     - 'true'
@@ -798,6 +807,18 @@ Resources:
                   - !Ref 'AuthSecret'
                   - !Ref 'ApiSecret'
                   - !Ref 'SesSmtpSecretArn'
+              - !If
+                - HasSesSmtpKmsKey
+                - Effect: Allow
+                  Action: kms:Decrypt
+                  Resource: !Ref 'SesSmtpKmsKeyArn'
+                  Condition:
+                    StringEquals:
+                      kms:ViaService: !Sub
+                        - 'secretsmanager.${SecretRegion}.${AWS::URLSuffix}'
+                        - SecretRegion: !Select [3, !Split [':', !Ref 'SesSmtpSecretArn']]
+                      kms:EncryptionContext:SecretARN: !Ref 'SesSmtpSecretArn'
+                - !Ref 'AWS::NoValue'
   RestExecutionRole:
     Type: AWS::IAM::Role
     Properties:
