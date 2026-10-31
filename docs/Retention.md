@@ -6,7 +6,7 @@ Choose retention under the organization's audit, recovery, and deletion policy. 
 
 `LogRetentionDays` controls the application/Lambda log group. `ServiceLogRetentionDays` separately controls both RDS export groups (`postgresql`, `upgrade`) and the cluster's Container Insights `performance` group. Its default, `0`, leaves service-log policies unchanged. A positive value sets their retention in days, including for existing groups.
 
-The stack creates missing RDS groups and, when Insights is enabled, its performance group. When Insights is disabled, an existing performance group still receives the selected retention, but an absent group is not created. Events, encryption settings, and other group configuration are preserved when adopting existing groups. Only retention is changed.
+The stack creates missing RDS groups and, when Insights is enabled, its performance group. When Insights is disabled, an existing performance group still receives the selected retention, but an absent group is not created. Existing groups are updated in place, preserving their encryption settings and other configuration. Events older than the selected retention become eligible for expiry.
 
 Setting the parameter back to `0`, or deleting the stack, leaves groups and their last retention policies in place. Zero stops management; it does not restore indefinite retention. To keep future events indefinitely after disabling management, an authorized administrator can run:
 
