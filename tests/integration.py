@@ -134,7 +134,7 @@ def run(directory, package):
     certmount = str(directory)+':/certs:ro'
     pgport = start('db', DATABASE_IMAGE, {'POSTGRES_PASSWORD': password}, 5432, 'db', mounts=[certmount],
                    entrypoint='/bin/bash', command=['-ec',
-                   'cp /certs/server.key /tmp/server.key; chown postgres:postgres /tmp/server.key; chmod 0600 /tmp/server.key; exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/certs/rds-ca.pem -c ssl_key_file=/tmp/server.key'])
+                   'cp /certs/server.key /certs/rds-ca.pem /tmp/; chown postgres:postgres /tmp/server.key /tmp/rds-ca.pem; chmod 0600 /tmp/server.key /tmp/rds-ca.pem; exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/tmp/rds-ca.pem -c ssl_key_file=/tmp/server.key'])
     database = dict(host='127.0.0.1', port=pgport, user='postgres', password=password, dbname='postgres',
                     sslmode='verify-full', sslrootcert=str(directory/'rds-ca.pem'), connect_timeout=3)
     for _ in range(60):
