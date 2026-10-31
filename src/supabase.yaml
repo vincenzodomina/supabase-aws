@@ -693,6 +693,12 @@ Resources:
               SSEAlgorithm: AES256
       VersioningConfiguration:
         Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: AbortIncompleteUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
       OwnershipControls:
         Rules:
           - ObjectOwnership: BucketOwnerEnforced
@@ -705,6 +711,8 @@ Resources:
     UpdateReplacePolicy: Retain
   BucketPolicy:
     Type: AWS::S3::BucketPolicy
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       Bucket: !Ref 'Bucket'
       PolicyDocument:
