@@ -45,13 +45,15 @@ def docker(*args, stderr=subprocess.PIPE, **kwargs):
 
 
 def start(name, image, environment, port=None, alias=None, mounts=(), entrypoint=None, command=(), network=None,
-          platform='linux/amd64', extra_ports=()):
+          platform='linux/amd64', extra_ports=(), hosts=()):
     name = prefix+'-'+name
     args = ['run', '-d', '--platform', platform, '--name', name, '--network', network or prefix]
     for exposed in (*extra_ports, *([port] if port else [])):
         args += ['-p', f'127.0.0.1::{exposed}']
     if alias:
         args += ['--network-alias', alias]
+    for host in hosts:
+        args += ['--add-host', host]
     for mount in mounts:
         args += ['-v', mount]
     if entrypoint:
@@ -174,7 +176,9 @@ def run(directory, package):
             raise RuntimeError('Lambda runtime startup timed out')
         request_id = secrets.token_hex(8)
         event = {'RequestType': request_type, 'ResourceType': resource_type, 'StackId': 'stack', 'RequestId': request_id,
-                 'LogicalResourceId': 'ServiceLogRetention' if resource_type == 'Custom::ServiceLogRetention' else 'Bootstrap',
+                 'LogicalResourceId': {'Custom::ServiceLogRetention': 'ServiceLogRetention',
+                                       'Custom::NetworkPrerequisites': 'EncryptionCheck',
+                                       'Custom::DatabaseBootstrap': 'Bootstrap'}[resource_type],
                  'ResourceProperties': properties if resource_properties is None else resource_properties,
                  'ResponseURL': internal_s3.generate_presigned_url('put_object', Params={'Bucket': 'artifacts', 'Key': request_id}, ExpiresIn=300)}
         if physical_id:
@@ -187,6 +191,15 @@ def run(directory, package):
         assert response['Status'] == expected, resource_type+' returned '+response['Status']
         assert response['RequestId'] == request_id
         return response['PhysicalResourceId']
+
+    network_args = dict(resource_type='Custom::NetworkPrerequisites', resource_properties={'Mode': 'service-connect-tls'})
+    network_identity = invoke(lambdaport, 'Create', **network_args)
+    assert network_identity == 'stack/network-prerequisites'
+    assert invoke(lambdaport, 'Update', physical_id=network_identity, **network_args) == network_identity
+    invoke(lambdaport, 'Delete', physical_id=network_identity, **network_args)
+    invoke(lambdaport, 'Create', expected='FAILED', resource_type='Custom::NetworkPrerequisites',
+           resource_properties={'Mode': 'none'})
+    print('PASS: packaged network prerequisite lifecycle and unsupported-mode rejection.', flush=True)
 
     groups = ['/aws/rds/instance/test/postgresql', '/aws/rds/instance/test/upgrade',
               '/aws/ecs/containerinsights/test/performance']
@@ -265,7 +278,7 @@ def run(directory, package):
     keys = dict(fixture_secrets['ApiSecret'])
     print('PASS: packaged Lambda, rollback/recovery, baseline validation, immutable migration history, private ledger and TLS rejection.', flush=True)
 
-    def start_service(name, overrides=None, network=None, extra_ports=()):
+    def start_service(name, overrides=None, network=None, extra_ports=(), hosts=()):
         task_name = 'AdminTask' if name in ('meta', 'studio') else name.title()+'Task'
         task = template['Resources'][task_name]['Properties']
         assert task['RuntimePlatform']['CpuArchitecture'] == {'Ref': 'EcsCpuArchitecture'}
@@ -291,7 +304,7 @@ def run(directory, package):
                      name+'.test.internal' if not network else None, mounts=[certmount],
                      entrypoint=entrypoint[0] if entrypoint else None,
                      command=entrypoint[1:]+definition.get('Command', []), network=network,
-                     platform=ecs_platform, extra_ports=extra_ports)
+                     platform=ecs_platform, extra_ports=extra_ports, hosts=hosts)
 
     certificate = template['Resources']['AuthTask']['Properties']['ContainerDefinitions'][0]
     readiness = next(c for c in template['Resources']['RestTask']['Properties']['ContainerDefinitions'] if c['Name'] == 'readiness')
@@ -343,7 +356,11 @@ def run(directory, package):
     docker('exec', prefix+'-readiness', *readiness['HealthCheck']['Command'][1:])
     storageport = start_service('storage', dict(aws_env, STORAGE_S3_ENDPOINT='http://moto:5000', STORAGE_S3_FORCE_PATH_STYLE='true'))
     wait_http(f'http://127.0.0.1:{storageport}/status')
-    gwport = start_service('gateway')
+    hosts = []
+    for service in ['auth', 'rest', 'storage']:
+        address = docker('inspect', '--format', '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}', prefix+'-'+service)
+        hosts.append(f'{service}.service-connect.invalid:{address}')
+    gwport = start_service('gateway', {'SERVICE_NAMESPACE': 'service-connect.invalid'}, hosts=hosts)
     url = f'http://127.0.0.1:{gwport}'
     wait_http(url+'/healthz')
     publishable = {'apikey': keys['SUPABASE_PUBLISHABLE_KEY']}
@@ -440,6 +457,7 @@ def run(directory, package):
     studioport = int(docker('port', prefix+'-meta', '3000').rsplit(':', 1)[1])
     wait_http(f'http://127.0.0.1:{studioport}/api/platform/profile')
     print(f'PASS: {ecs_architecture} application/helper containers and paired Studio/meta startup.', flush=True)
+    print('PASS: pinned Envoy routes through host-file aliases absent from DNS.', flush=True)
     assert invoke(lambdaport, 'Delete', physical_id=identity) == identity
     assert request(url+'/auth/v1/user', headers=dict(publishable, Authorization='Bearer '+user['access_token']))[0] == 200
     modes = docker('exec', prefix+'-gateway', 'stat', '-c', '%a', '/etc/envoy/lds.yaml')

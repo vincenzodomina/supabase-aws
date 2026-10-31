@@ -41,6 +41,7 @@ This community-maintained project addresses those two core needs: RDS compatibil
 | US-12 | As an application developer, I want a ready-to-use Supabase URL and anon key, with support for upstream-recommended client credentials, so that I can use standard Supabase clients for the supported capabilities. |
 | US-13 | As an application team, I want to deploy our own ECS application alongside Supabase in the same VPC and connect privately, so that backend-to-backend traffic stays within our company network. |
 | US-14 | As an operator, I want the stack to establish the private communication its Supabase services need and maintain it through scaling and replacement, so that the services continue working together. |
+| US-38 | As a security owner, I want to choose between enforced encryption supplied by our enterprise VPC and TLS between service tasks, so that internal communication is protected using the approach that fits our infrastructure. |
 | US-15 | As a security owner, I want private-only access to be supported and any client-facing exposure to be an explicit choice, so that the deployment follows our network access policy. |
 | US-16 | As an administrator, I want to enable or disable Studio and its metadata administration capability together, with access restricted to approved private users, so that administration is available only where needed. |
 

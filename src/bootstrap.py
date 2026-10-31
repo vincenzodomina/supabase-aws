@@ -1,4 +1,4 @@
-"""Provision RDS prerequisites and optional retention for service-created log groups."""
+"""Verify network prerequisites, provision RDS, and manage optional log retention."""
 import base64
 import hashlib
 import hmac
@@ -119,6 +119,20 @@ def bootstrap(properties):
     print('Database prerequisites and service credentials are ready.')
 
 
+def verify_network(properties):
+    if properties['Mode'] == 'service-connect-tls':
+        return
+    if properties['Mode'] != 'vpc':
+        raise ValueError('Unsupported internal encryption mode')
+    client = boto3.client('ec2', config=Config(
+        connect_timeout=5, read_timeout=10, retries={'mode': 'standard', 'total_max_attempts': 3}))
+    response = client.describe_vpc_encryption_controls(VpcIds=[properties['VpcId']])
+    controls = response['VpcEncryptionControls']
+    if len(controls) != 1 or controls[0].get('VpcId') != properties['VpcId'] or \
+       controls[0].get('Mode') != 'enforce' or controls[0].get('State') != 'available':
+        raise RuntimeError('The existing VPC must have available encryption enforcement')
+
+
 def retain_service_logs(properties):
     client = boto3.client('logs', config=Config(
         connect_timeout=5, read_timeout=10, retries={'mode': 'standard', 'total_max_attempts': 3}))
@@ -138,8 +152,13 @@ def retain_service_logs(properties):
 
 def handler(event, context):
     retention = event['ResourceType'] == 'Custom::ServiceLogRetention'
-    operation = 'Service log retention' if retention else 'Database bootstrap'
-    suffix = '/service-log-retention' if retention else '/database-bootstrap'
+    network = event['ResourceType'] == 'Custom::NetworkPrerequisites'
+    if network:
+        operation, suffix = 'Network prerequisites', '/network-prerequisites'
+    elif retention:
+        operation, suffix = 'Service log retention', '/service-log-retention'
+    else:
+        operation, suffix = 'Database bootstrap', '/database-bootstrap'
     physical_id = event.get('PhysicalResourceId', event['StackId'] + suffix)
     status, reason = 'SUCCESS', operation + ' completed'
 
@@ -149,20 +168,24 @@ def handler(event, context):
     previous = signal.signal(signal.SIGALRM, timeout)
     try:
         if event['RequestType'] != 'Delete':
-            if event['ResourceType'] not in ('Custom::DatabaseBootstrap', 'Custom::ServiceLogRetention'):
+            if event['ResourceType'] not in ('Custom::DatabaseBootstrap', 'Custom::ServiceLogRetention', 'Custom::NetworkPrerequisites'):
                 raise ValueError('Unsupported custom resource type')
             seconds = context.get_remaining_time_in_millis() / 1000 - 30
             if seconds <= 0:
                 raise TimeoutError('Insufficient time to handle the custom resource')
             # Leave time to report failure before Lambda terminates the invocation.
             signal.setitimer(signal.ITIMER_REAL, seconds)
-            if retention:
+            if network:
+                verify_network(event['ResourceProperties'])
+            elif retention:
                 retain_service_logs(event['ResourceProperties'])
             else:
                 bootstrap(event['ResourceProperties'])
     except Exception as error:
         print(f'{operation} failed: {type(error).__name__}; request {event["RequestId"]}')
         status, reason = 'FAILED', operation + ' failed; inspect the Lambda log stream.'
+        if network:
+            reason = 'Network prerequisites failed; check the VPC enforcement state and EC2 API access.'
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, previous)

@@ -83,13 +83,47 @@ class BootstrapLifecycleTest(unittest.TestCase):
                 database_work.assert_not_called()
                 stub.assert_no_pending_responses()
 
-    def test_log_retention_delete_does_not_call_aws(self):
-        self.event.update(ResourceType='Custom::ServiceLogRetention', RequestType='Delete', PhysicalResourceId='logs')
-        with patch.object(bootstrap.boto3, 'client') as client:
-            payload = self.invoke(Mock())
-        self.assertEqual(payload['Status'], 'SUCCESS')
-        self.assertEqual(payload['PhysicalResourceId'], 'logs')
-        client.assert_not_called()
+    def test_network_check_requires_available_enforcement_for_the_requested_vpc(self):
+        client = boto3.client('ec2', region_name='us-east-1', aws_access_key_id='test', aws_secret_access_key='test')
+        self.event.update(ResourceType='Custom::NetworkPrerequisites',
+                          ResourceProperties={'Mode': 'vpc', 'VpcId': 'vpc-12345678'})
+        control = {'VpcId': 'vpc-12345678', 'Mode': 'enforce', 'State': 'available'}
+        cases = [('valid', [control]), ('missing', []), ('monitor', [dict(control, Mode='monitor')]),
+                 ('transition', [dict(control, State='modify-in-progress')]),
+                 ('wrong-vpc', [dict(control, VpcId='vpc-87654321')]), ('denied', None)]
+        for name, controls in cases:
+            with self.subTest(case=name), Stubber(client) as stub, patch.object(bootstrap.boto3, 'client', return_value=client):
+                if controls is None:
+                    stub.add_client_error('describe_vpc_encryption_controls', 'UnauthorizedOperation',
+                                          expected_params={'VpcIds': ['vpc-12345678']})
+                else:
+                    stub.add_response('describe_vpc_encryption_controls', {'VpcEncryptionControls': controls},
+                                      {'VpcIds': ['vpc-12345678']})
+                database_work = Mock()
+                payload = self.invoke(database_work)
+                self.assertEqual(payload['Status'], 'SUCCESS' if name == 'valid' else 'FAILED')
+                self.assertEqual(payload['PhysicalResourceId'], 'stack/network-prerequisites')
+                database_work.assert_not_called()
+                stub.assert_no_pending_responses()
+
+    def test_tls_mode_needs_no_vpc_api_and_unknown_mode_fails(self):
+        self.event['ResourceType'] = 'Custom::NetworkPrerequisites'
+        for mode, expected in [('service-connect-tls', 'SUCCESS'), ('none', 'FAILED')]:
+            with self.subTest(mode=mode), patch.object(bootstrap.boto3, 'client') as client:
+                self.event['ResourceProperties'] = {'Mode': mode}
+                database_work = Mock()
+                self.assertEqual(self.invoke(database_work)['Status'], expected)
+                client.assert_not_called()
+                database_work.assert_not_called()
+
+    def test_non_database_resource_deletion_does_not_call_aws(self):
+        for resource_type in ['Custom::ServiceLogRetention', 'Custom::NetworkPrerequisites']:
+            self.event.update(ResourceType=resource_type, RequestType='Delete', PhysicalResourceId='existing')
+            with self.subTest(resource_type=resource_type), patch.object(bootstrap.boto3, 'client') as client:
+                payload = self.invoke(Mock())
+            self.assertEqual(payload['Status'], 'SUCCESS')
+            self.assertEqual(payload['PhysicalResourceId'], 'existing')
+            client.assert_not_called()
 
 
 if __name__ == '__main__':
