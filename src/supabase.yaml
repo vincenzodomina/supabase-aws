@@ -1,0 +1,2837 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Supabase on ECS Fargate with RDS PostgreSQL and S3; existing network and SES required.
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Existing VPC with DNS support and hostnames enabled.
+  PublicSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Two public subnets in distinct AZs for the API load balancer.
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Two private subnets in distinct AZs with outbound HTTPS/SES SMTP access.
+  DatabaseSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Existing private database subnets in at least two AZs.
+  CertificateArn:
+    Type: String
+    Description: Existing ACM certificate covering API and optional Studio names, in this region.
+    AllowedPattern: arn:[^:]+:acm:[^:]+:[0-9]{12}:certificate/.+
+  ApiDomainName:
+    Type: String
+    Description: API DNS hostname; point it at ApiLoadBalancerDnsName.
+    AllowedPattern: '[a-z0-9][a-z0-9.-]+\.[a-z]{2,}'
+  HostedZoneId:
+    Type: String
+    Description: Optional existing public Route 53 zone; empty means manage DNS yourself.
+    Default: ''
+  SiteUrl:
+    Type: String
+    Description: Application URL used in Auth email links.
+    AllowedPattern: https://[^\s]+
+  AdditionalRedirectUrls:
+    Type: String
+    Description: Comma-separated Auth redirect allow list.
+    Default: ''
+  SesRegion:
+    Type: String
+    Description: Region containing the verified SES identity and SMTP credentials.
+    Default: us-east-1
+  SesSenderEmail:
+    Type: String
+    Description: Verified SES sender email address.
+    AllowedPattern: '[^\s@]+@[^\s@]+'
+  SesSmtpSecretArn:
+    Type: String
+    Description: Existing Secrets Manager JSON secret with username and password (SES SMTP credentials).
+    AllowedPattern: arn:[^:]+:secretsmanager:[^:]+:[0-9]{12}:secret:.+
+  EnableStudio:
+    Type: String
+    Description: Create Studio and postgres-meta together, behind an internal HTTPS ALB.
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'false'
+  StudioDomainName:
+    Type: String
+    Description: DNS name for optional Studio; resolve to the internal ALB.
+    Default: ''
+  StudioClientCidr:
+    Type: String
+    Description: Private/VPN client IPv4 CIDR permitted to reach Studio.
+    AllowedPattern: (10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)[0-9./]+
+    Default: 10.0.0.0/8
+  ArtifactsBucket:
+    Type: String
+    Description: Existing private artifact bucket in this region; supplied by deploy.sh.
+  BootstrapKey:
+    Type: String
+    Description: Content-addressed Lambda ZIP object key; supplied by deploy.sh.
+  CertificateKey:
+    Type: String
+    Description: Content-addressed RDS CA bundle object key; supplied by deploy.sh.
+  DatabaseEngineVersion:
+    Type: String
+    Description: RDS PostgreSQL 17 minor version available in the target region.
+    AllowedPattern: 17\.[0-9]+
+    Default: '17.6'
+  DatabaseInstanceClass:
+    Type: String
+    Description: RDS instance size; tune together with service connection limits.
+    Default: db.t4g.medium
+  DatabaseMultiAZ:
+    Type: String
+    Description: Enable RDS standby in another Availability Zone.
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'true'
+  DatabaseDeletionProtection:
+    Type: String
+    Description: Disable explicitly before deleting the stack.
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'true'
+  DatabaseAllocatedStorage:
+    Type: Number
+    Description: Initial RDS gp3 storage in GiB.
+    MinValue: 20
+    Default: 20
+  DatabaseMaxAllocatedStorage:
+    Type: Number
+    Description: Maximum autoscaled RDS storage in GiB.
+    MinValue: 20
+    Default: 100
+  DatabaseBackupRetentionDays:
+    Type: Number
+    Description: RDS automated backup retention.
+    MinValue: 1
+    MaxValue: 35
+    Default: 14
+  LogRetentionDays:
+    Type: Number
+    Description: CloudWatch log retention.
+    AllowedValues:
+      - 7
+      - 14
+      - 30
+      - 60
+      - 90
+      - 180
+      - 365
+    Default: 30
+  FileSizeLimitBytes:
+    Type: Number
+    Description: Maximum Storage upload size.
+    MinValue: 1
+    Default: 52428800
+  DisableSignup:
+    Type: String
+    Description: Require invitations/admin-created users.
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'true'
+  ApiSchemas:
+    Type: String
+    Description: Explicit PostgREST schema allow list. New tables need grants and RLS.
+    Default: public
+  GatewayMinTasks:
+    Type: Number
+    Description: Minimum Gateway replicas; production default spans two AZs.
+    MinValue: 1
+    MaxValue: 4
+    Default: 2
+  GatewayMaxTasks:
+    Type: Number
+    Description: Maximum Gateway replicas; bound by database connection capacity.
+    MinValue: 1
+    MaxValue: 20
+    Default: 4
+  GatewayCpu:
+    Type: String
+    Description: Gateway Fargate CPU units.
+    AllowedValues:
+      - '256'
+      - '512'
+      - '1024'
+      - '2048'
+    Default: '256'
+  GatewayMemory:
+    Type: String
+    Description: Gateway Fargate memory MiB; must be valid for selected CPU.
+    Default: '512'
+  AuthMinTasks:
+    Type: Number
+    Description: Minimum Auth replicas; production default spans two AZs.
+    MinValue: 1
+    MaxValue: 4
+    Default: 2
+  AuthMaxTasks:
+    Type: Number
+    Description: Maximum Auth replicas; bound by database connection capacity.
+    MinValue: 1
+    MaxValue: 20
+    Default: 4
+  AuthCpu:
+    Type: String
+    Description: Auth Fargate CPU units.
+    AllowedValues:
+      - '256'
+      - '512'
+      - '1024'
+      - '2048'
+    Default: '256'
+  AuthMemory:
+    Type: String
+    Description: Auth Fargate memory MiB; must be valid for selected CPU.
+    Default: '512'
+  RestMinTasks:
+    Type: Number
+    Description: Minimum Rest replicas; production default spans two AZs.
+    MinValue: 1
+    MaxValue: 4
+    Default: 2
+  RestMaxTasks:
+    Type: Number
+    Description: Maximum Rest replicas; bound by database connection capacity.
+    MinValue: 1
+    MaxValue: 20
+    Default: 4
+  RestCpu:
+    Type: String
+    Description: Rest Fargate CPU units.
+    AllowedValues:
+      - '256'
+      - '512'
+      - '1024'
+      - '2048'
+    Default: '256'
+  RestMemory:
+    Type: String
+    Description: Rest Fargate memory MiB; must be valid for selected CPU.
+    Default: '512'
+  StorageMinTasks:
+    Type: Number
+    Description: Minimum Storage replicas; production default spans two AZs.
+    MinValue: 1
+    MaxValue: 4
+    Default: 2
+  StorageMaxTasks:
+    Type: Number
+    Description: Maximum Storage replicas; bound by database connection capacity.
+    MinValue: 1
+    MaxValue: 20
+    Default: 4
+  StorageCpu:
+    Type: String
+    Description: Storage Fargate CPU units.
+    AllowedValues:
+      - '256'
+      - '512'
+      - '1024'
+      - '2048'
+    Default: '256'
+  StorageMemory:
+    Type: String
+    Description: Storage Fargate memory MiB; must be valid for selected CPU.
+    Default: '1024'
+  AlarmTopicArn:
+    Type: String
+    Default: ''
+    Description: Optional existing SNS topic ARN for operational alarms.
+Conditions:
+  RunStudio: !Equals
+    - !Ref 'EnableStudio'
+    - 'true'
+  CreateDns: !Not
+    - !Equals
+      - !Ref 'HostedZoneId'
+      - ''
+  MultiAZ: !Equals
+    - !Ref 'DatabaseMultiAZ'
+    - 'true'
+  ProtectDatabase: !Equals
+    - !Ref 'DatabaseDeletionProtection'
+    - 'true'
+  HasAlarmTopic: !Not
+    - !Equals
+      - !Ref 'AlarmTopicArn'
+      - ''
+Resources:
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: !Ref 'LogRetentionDays'
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+  Namespace:
+    Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+    Properties:
+      Name: !Sub '${AWS::StackName}.internal'
+      Vpc: !Ref 'VpcId'
+  ApiAlbSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ApiAlb Supabase access
+      VpcId: !Ref 'VpcId'
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+  GatewaySG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Gateway Supabase access
+      VpcId: !Ref 'VpcId'
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+  AuthSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Auth Supabase access
+      VpcId: !Ref 'VpcId'
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+  RestSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Rest Supabase access
+      VpcId: !Ref 'VpcId'
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+  StorageSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Storage Supabase access
+      VpcId: !Ref 'VpcId'
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+  AdminSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Admin Supabase access
+      VpcId: !Ref 'VpcId'
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+  AdminAlbSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: AdminAlb Supabase access
+      VpcId: !Ref 'VpcId'
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+  BootstrapSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Bootstrap Supabase access
+      VpcId: !Ref 'VpcId'
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+  DatabaseSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Database Supabase access
+      VpcId: !Ref 'VpcId'
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+  PublicHttps:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref 'ApiAlbSG'
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: 0.0.0.0/0
+  AdminHttps:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref 'AdminAlbSG'
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: !Ref 'StudioClientCidr'
+  PublicGatewayIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref 'GatewaySG'
+      SourceSecurityGroupId: !Ref 'ApiAlbSG'
+      IpProtocol: tcp
+      FromPort: 8000
+      ToPort: 8000
+  PublicGatewayEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref 'ApiAlbSG'
+      DestinationSecurityGroupId: !Ref 'GatewaySG'
+      IpProtocol: tcp
+      FromPort: 8000
+      ToPort: 8000
+  AdminUiIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref 'AdminSG'
+      SourceSecurityGroupId: !Ref 'AdminAlbSG'
+      IpProtocol: tcp
+      FromPort: 3000
+      ToPort: 3000
+  AdminUiEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref 'AdminAlbSG'
+      DestinationSecurityGroupId: !Ref 'AdminSG'
+      IpProtocol: tcp
+      FromPort: 3000
+      ToPort: 3000
+  AdminGatewayIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref 'GatewaySG'
+      SourceSecurityGroupId: !Ref 'AdminSG'
+      IpProtocol: tcp
+      FromPort: 8000
+      ToPort: 8000
+  AdminGatewayEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref 'AdminSG'
+      DestinationSecurityGroupId: !Ref 'GatewaySG'
+      IpProtocol: tcp
+      FromPort: 8000
+      ToPort: 8000
+  GatewayAuthIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref 'AuthSG'
+      SourceSecurityGroupId: !Ref 'GatewaySG'
+      IpProtocol: tcp
+      FromPort: 9999
+      ToPort: 9999
+  GatewayAuthEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref 'GatewaySG'
+      DestinationSecurityGroupId: !Ref 'AuthSG'
+      IpProtocol: tcp
+      FromPort: 9999
+      ToPort: 9999
+  GatewayRestIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref 'RestSG'
+      SourceSecurityGroupId: !Ref 'GatewaySG'
+      IpProtocol: tcp
+      FromPort: 3000
+      ToPort: 3000
+  GatewayRestEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref 'GatewaySG'
+      DestinationSecurityGroupId: !Ref 'RestSG'
+      IpProtocol: tcp
+      FromPort: 3000
+      ToPort: 3000
+  GatewayStorageIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref 'StorageSG'
+      SourceSecurityGroupId: !Ref 'GatewaySG'
+      IpProtocol: tcp
+      FromPort: 5000
+      ToPort: 5000
+  GatewayStorageEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref 'GatewaySG'
+      DestinationSecurityGroupId: !Ref 'StorageSG'
+      IpProtocol: tcp
+      FromPort: 5000
+      ToPort: 5000
+  StorageRestIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref 'RestSG'
+      SourceSecurityGroupId: !Ref 'StorageSG'
+      IpProtocol: tcp
+      FromPort: 3000
+      ToPort: 3000
+  StorageRestEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref 'StorageSG'
+      DestinationSecurityGroupId: !Ref 'RestSG'
+      IpProtocol: tcp
+      FromPort: 3000
+      ToPort: 3000
+  AuthDatabaseIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref 'DatabaseSG'
+      SourceSecurityGroupId: !Ref 'AuthSG'
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+  AuthDatabaseEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref 'AuthSG'
+      DestinationSecurityGroupId: !Ref 'DatabaseSG'
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+  RestDatabaseIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref 'DatabaseSG'
+      SourceSecurityGroupId: !Ref 'RestSG'
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+  RestDatabaseEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref 'RestSG'
+      DestinationSecurityGroupId: !Ref 'DatabaseSG'
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+  StorageDatabaseIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref 'DatabaseSG'
+      SourceSecurityGroupId: !Ref 'StorageSG'
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+  StorageDatabaseEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref 'StorageSG'
+      DestinationSecurityGroupId: !Ref 'DatabaseSG'
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+  AdminDatabaseIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref 'DatabaseSG'
+      SourceSecurityGroupId: !Ref 'AdminSG'
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+  AdminDatabaseEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref 'AdminSG'
+      DestinationSecurityGroupId: !Ref 'DatabaseSG'
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+  BootstrapDatabaseIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref 'DatabaseSG'
+      SourceSecurityGroupId: !Ref 'BootstrapSG'
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+  BootstrapDatabaseEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref 'BootstrapSG'
+      DestinationSecurityGroupId: !Ref 'DatabaseSG'
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+  AuthSmtp:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref 'AuthSG'
+      IpProtocol: tcp
+      FromPort: 587
+      ToPort: 587
+      CidrIp: 0.0.0.0/0
+  DatabaseSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "postgres"}'
+        GenerateStringKey: password
+        PasswordLength: 48
+        ExcludePunctuation: true
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+  AuthSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "supabase_auth_admin"}'
+        GenerateStringKey: password
+        PasswordLength: 48
+        ExcludePunctuation: true
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+  RestSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "authenticator"}'
+        GenerateStringKey: password
+        PasswordLength: 48
+        ExcludePunctuation: true
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+  StorageSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "supabase_storage_admin"}'
+        GenerateStringKey: password
+        PasswordLength: 48
+        ExcludePunctuation: true
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+  ApiSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      GenerateSecretString:
+        SecretStringTemplate: '{}'
+        GenerateStringKey: JWT_SECRET
+        PasswordLength: 48
+        ExcludePunctuation: true
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+  MetaSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      GenerateSecretString:
+        SecretStringTemplate: '{}'
+        GenerateStringKey: crypto_key
+        PasswordLength: 48
+        ExcludePunctuation: true
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+  DbSubnets:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Existing private database subnets
+      SubnetIds: !Ref 'DatabaseSubnetIds'
+  DbParameters:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Description: Supabase PostgreSQL 17 TLS policy
+      Family: postgres17
+      Parameters:
+        rds.force_ssl: '1'
+        password_encryption: scram-sha-256
+  Database:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      Engine: postgres
+      EngineVersion: !Ref 'DatabaseEngineVersion'
+      DBName: postgres
+      MasterUsername: postgres
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${DatabaseSecret}:SecretString:password}}'
+      DBInstanceClass: !Ref 'DatabaseInstanceClass'
+      DBSubnetGroupName: !Ref 'DbSubnets'
+      DBParameterGroupName: !Ref 'DbParameters'
+      VPCSecurityGroups:
+        - !Ref 'DatabaseSG'
+      AllocatedStorage: !Ref 'DatabaseAllocatedStorage'
+      MaxAllocatedStorage: !Ref 'DatabaseMaxAllocatedStorage'
+      StorageType: gp3
+      StorageEncrypted: true
+      PubliclyAccessible: false
+      MultiAZ: !If [MultiAZ, true, false]
+      DeletionProtection: !If [ProtectDatabase, true, false]
+      BackupRetentionPeriod: !Ref 'DatabaseBackupRetentionDays'
+      AutoMinorVersionUpgrade: true
+      CopyTagsToSnapshot: true
+      EnableCloudwatchLogsExports:
+        - postgresql
+        - upgrade
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+  Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref 'Bucket'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt 'Bucket.Arn'
+              - !Sub '${Bucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+  GatewayExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !GetAtt 'LogGroup.Arn'
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref 'ApiSecret'
+  AuthExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !GetAtt 'LogGroup.Arn'
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref 'AuthSecret'
+                  - !Ref 'ApiSecret'
+                  - !Ref 'SesSmtpSecretArn'
+  RestExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !GetAtt 'LogGroup.Arn'
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref 'RestSecret'
+                  - !Ref 'ApiSecret'
+  StorageExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !GetAtt 'LogGroup.Arn'
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref 'StorageSecret'
+                  - !Ref 'ApiSecret'
+  AdminExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !GetAtt 'LogGroup.Arn'
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref 'DatabaseSecret'
+                  - !Ref 'ApiSecret'
+                  - !Ref 'MetaSecret'
+  StorageRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                Resource:
+                  - !GetAtt 'Bucket.Arn'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:AbortMultipartUpload
+                  - s3:ListMultipartUploadParts
+                Resource:
+                  - !Sub '${Bucket.Arn}/*'
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ArtifactsBucket}/${CertificateKey}'
+  CertificatesRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ReadCertificate
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ArtifactsBucket}/${CertificateKey}'
+  BootstrapRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt 'LogGroup.Arn'
+              - Effect: Allow
+                Action:
+                  - ec2:CreateNetworkInterface
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DescribeSubnets
+                  - ec2:DeleteNetworkInterface
+                  - ec2:AssignPrivateIpAddresses
+                  - ec2:UnassignPrivateIpAddresses
+                Resource: '*'
+              - Effect: Deny
+                Action:
+                  - ec2:CreateNetworkInterface
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DescribeSubnets
+                  - ec2:DeleteNetworkInterface
+                  - ec2:AssignPrivateIpAddresses
+                  - ec2:UnassignPrivateIpAddresses
+                Resource: '*'
+                Condition:
+                  ArnLike:
+                    lambda:SourceFunctionArn: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:*'
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref 'DatabaseSecret'
+                  - !Ref 'AuthSecret'
+                  - !Ref 'RestSecret'
+                  - !Ref 'StorageSecret'
+                  - !Ref 'ApiSecret'
+              - Effect: Allow
+                Action: secretsmanager:PutSecretValue
+                Resource:
+                  - !Ref 'AuthSecret'
+                  - !Ref 'RestSecret'
+                  - !Ref 'StorageSecret'
+                  - !Ref 'ApiSecret'
+  BootstrapHandler:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.13
+      Architectures: [x86_64]
+      Handler: bootstrap.handler
+      Role: !GetAtt 'BootstrapRole.Arn'
+      Timeout: 900
+      MemorySize: 256
+      ReservedConcurrentExecutions: 1
+      VpcConfig:
+        SubnetIds: !Ref 'PrivateSubnetIds'
+        SecurityGroupIds:
+          - !Ref 'BootstrapSG'
+      LoggingConfig:
+        LogGroup: !Ref 'LogGroup'
+      Code:
+        S3Bucket: !Ref 'ArtifactsBucket'
+        S3Key: !Ref 'BootstrapKey'
+  Bootstrap:
+    Type: Custom::DatabaseBootstrap
+    Properties:
+      ServiceToken: !GetAtt 'BootstrapHandler.Arn'
+      ServiceTimeout: 960
+      Revision: !Ref 'BootstrapKey'
+      DatabaseHost: !GetAtt 'Database.Endpoint.Address'
+      DatabasePort: !GetAtt 'Database.Endpoint.Port'
+      DatabaseSecret: !Ref 'DatabaseSecret'
+      AuthSecret: !Ref 'AuthSecret'
+      RestSecret: !Ref 'RestSecret'
+      StorageSecret: !Ref 'StorageSecret'
+      ApiSecret: !Ref 'ApiSecret'
+    DependsOn:
+      - BootstrapDatabaseIngress
+      - BootstrapDatabaseEgress
+  GatewayTask:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Cpu: !Ref 'GatewayCpu'
+      Memory: !Ref 'GatewayMemory'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !GetAtt 'GatewayExecutionRole.Arn'
+      ContainerDefinitions:
+        - Name: gateway
+          Image: envoyproxy/envoy:v1.39.1@sha256:57e14a549d7bd43c8d3f6d03e8cfa653e037d4b38e133acd9b54f38c524401b4
+          EntryPoint: [/bin/sh, -ec]
+          Command:
+            - "@include src/gateway-entrypoint.sh"
+          PortMappings:
+            - ContainerPort: 8000
+          Environment:
+            - Name: SERVICE_NAMESPACE
+              Value: !Sub '${AWS::StackName}.internal'
+            - Name: ENVOY_BOOTSTRAP
+              Value: |
+                dynamic_resources:
+                  cds_config:
+                    path_config_source:
+                      path: /etc/envoy/cds.yaml
+                    resource_api_version: V3
+                  lds_config:
+                    path_config_source:
+                      path: /etc/envoy/lds.yaml
+                    resource_api_version: V3
+
+                node:
+                  cluster: supabase_cluster
+                  id: supabase_node
+
+                overload_manager:
+                  resource_monitors:
+                    - name: envoy.resource_monitors.global_downstream_max_connections
+                      typed_config:
+                        '@type': >-
+                          type.googleapis.com/envoy.extensions.resource_monitors.downstream_connections.v3.DownstreamConnectionsConfig
+                        max_active_downstream_connections: 30000
+
+                admin:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 9901
+            - Name: ENVOY_CLUSTERS
+              Value: |
+                resources:
+                - '@type': type.googleapis.com/envoy.config.cluster.v3.Cluster
+                  name: auth
+                  connect_timeout: 5s
+                  type: STRICT_DNS
+                  dns_refresh_rate: 5s
+                  dns_failure_refresh_rate:
+                    base_interval: 1s
+                    max_interval: 1s
+                  lb_policy: ROUND_ROBIN
+                  load_assignment:
+                    cluster_name: auth
+                    endpoints:
+                    - lb_endpoints:
+                      - endpoint:
+                          address:
+                            socket_address:
+                              address: auth.${SERVICE_NAMESPACE}
+                              port_value: 9999
+                  health_checks:
+                  - timeout: 2s
+                    interval: 5s
+                    unhealthy_threshold: 3
+                    healthy_threshold: 2
+                    http_health_check:
+                      path: /health
+                  circuit_breakers:
+                    thresholds:
+                    - priority: DEFAULT
+                      max_connections: 10000
+                      max_pending_requests: 10000
+                      max_requests: 10000
+                - '@type': type.googleapis.com/envoy.config.cluster.v3.Cluster
+                  name: rest
+                  connect_timeout: 5s
+                  type: STRICT_DNS
+                  dns_refresh_rate: 5s
+                  dns_failure_refresh_rate:
+                    base_interval: 1s
+                    max_interval: 1s
+                  lb_policy: ROUND_ROBIN
+                  load_assignment:
+                    cluster_name: rest
+                    endpoints:
+                    - lb_endpoints:
+                      - endpoint:
+                          address:
+                            socket_address:
+                              address: rest.${SERVICE_NAMESPACE}
+                              port_value: 3000
+                  health_checks:
+                  - timeout: 2s
+                    interval: 5s
+                    unhealthy_threshold: 3
+                    healthy_threshold: 2
+                    http_health_check:
+                      path: /
+                  circuit_breakers:
+                    thresholds:
+                    - priority: DEFAULT
+                      max_connections: 10000
+                      max_pending_requests: 10000
+                      max_requests: 10000
+                - '@type': type.googleapis.com/envoy.config.cluster.v3.Cluster
+                  name: storage
+                  connect_timeout: 5s
+                  type: STRICT_DNS
+                  dns_refresh_rate: 5s
+                  dns_failure_refresh_rate:
+                    base_interval: 1s
+                    max_interval: 1s
+                  lb_policy: ROUND_ROBIN
+                  load_assignment:
+                    cluster_name: storage
+                    endpoints:
+                    - lb_endpoints:
+                      - endpoint:
+                          address:
+                            socket_address:
+                              address: storage.${SERVICE_NAMESPACE}
+                              port_value: 5000
+                  health_checks:
+                  - timeout: 2s
+                    interval: 5s
+                    unhealthy_threshold: 3
+                    healthy_threshold: 2
+                    http_health_check:
+                      path: /status
+                  circuit_breakers:
+                    thresholds:
+                    - priority: DEFAULT
+                      max_connections: 10000
+                      max_pending_requests: 10000
+                      max_requests: 10000
+            - Name: ENVOY_LISTENERS
+              Value: |
+                resources:
+                  - '@type': type.googleapis.com/envoy.config.listener.v3.Listener
+                    name: supabase
+                    per_connection_buffer_limit_bytes: 32768
+                    address:
+                      socket_address:
+                        address: 0.0.0.0
+                        port_value: 8000
+                    filter_chains:
+                      - filters:
+                          - name: envoy.filters.network.http_connection_manager
+                            typed_config:
+                              '@type': type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                              stat_prefix: ingress_http
+                              normalize_path: true
+                              merge_slashes: true
+                              path_with_escaped_slashes_action: REJECT_REQUEST
+                              use_remote_address: true
+                              common_http_protocol_options:
+                                headers_with_underscores_action: REJECT_REQUEST
+                              access_log:
+                                - name: envoy.access_loggers.stdout
+                                  typed_config:
+                                    '@type': type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+                                    log_format:
+                                      json_format:
+                                        method: '%REQ(:METHOD)%'
+                                        status: '%RESPONSE_CODE%'
+                                        duration_ms: '%DURATION%'
+                                        request_id: '%REQ(X-REQUEST-ID)%'
+                              route_config:
+                                name: supabase_route
+                                virtual_hosts:
+                                  - name: supabase_host
+                                    domains:
+                                      - '*'
+                                    cors:
+                                      allow_origin_string_match:
+                                        - safe_regex:
+                                            regex: .*
+                                      allow_methods: GET,POST,PUT,PATCH,DELETE,OPTIONS,HEAD,CONNECT,TRACE
+                                      allow_headers: '*'
+                                      expose_headers: '*'
+                                      max_age: '3600'
+                                    request_headers_to_add:
+                                      - header:
+                                          key: X-Forwarded-Host
+                                          value: '%REQ(:AUTHORITY)%'
+                                        append_action: ADD_IF_ABSENT
+                                      - header:
+                                          key: X-Forwarded-Port
+                                          value: '%DOWNSTREAM_LOCAL_PORT%'
+                                        append_action: ADD_IF_ABSENT
+                                    routes:
+                                      - match:
+                                          path: /healthz
+                                        direct_response:
+                                          status: 200
+                                          body:
+                                            inline_string: ok
+                                        typed_per_filter_config: &public_access
+                                          envoy.filters.http.rbac:
+                                            '@type': type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBACPerRoute
+                                            rbac:
+                                              rules:
+                                                action: ALLOW
+                                                policies:
+                                                  allow_all:
+                                                    permissions:
+                                                      - any: true
+                                                    principals:
+                                                      - any: true
+                                      - match:
+                                          prefix: /auth/v1/verify
+                                        route:
+                                          cluster: auth
+                                          prefix_rewrite: /verify
+                                          timeout: 30s
+                                        request_headers_to_add:
+                                          - header:
+                                              key: X-Forwarded-Prefix
+                                              value: /auth/v1/verify
+                                            append_action: ADD_IF_ABSENT
+                                        typed_per_filter_config:
+                                          envoy.filters.http.rbac:
+                                            '@type': type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBACPerRoute
+                                            rbac:
+                                              rules:
+                                                action: ALLOW
+                                                policies:
+                                                  allow_all:
+                                                    permissions:
+                                                      - any: true
+                                                    principals:
+                                                      - any: true
+                                      - match:
+                                          prefix: /auth/v1/callback
+                                        route:
+                                          cluster: auth
+                                          prefix_rewrite: /callback
+                                          timeout: 30s
+                                        request_headers_to_add:
+                                          - header:
+                                              key: X-Forwarded-Prefix
+                                              value: /auth/v1/callback
+                                            append_action: ADD_IF_ABSENT
+                                        typed_per_filter_config:
+                                          envoy.filters.http.rbac:
+                                            '@type': type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBACPerRoute
+                                            rbac:
+                                              rules:
+                                                action: ALLOW
+                                                policies:
+                                                  allow_all:
+                                                    permissions:
+                                                      - any: true
+                                                    principals:
+                                                      - any: true
+                                      - match:
+                                          prefix: /auth/v1/authorize
+                                        route:
+                                          cluster: auth
+                                          prefix_rewrite: /authorize
+                                          timeout: 30s
+                                        request_headers_to_add:
+                                          - header:
+                                              key: X-Forwarded-Prefix
+                                              value: /auth/v1/authorize
+                                            append_action: ADD_IF_ABSENT
+                                        typed_per_filter_config:
+                                          envoy.filters.http.rbac:
+                                            '@type': type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBACPerRoute
+                                            rbac:
+                                              rules:
+                                                action: ALLOW
+                                                policies:
+                                                  allow_all:
+                                                    permissions:
+                                                      - any: true
+                                                    principals:
+                                                      - any: true
+                                      - match:
+                                          prefix: /auth/v1/.well-known/jwks.json
+                                        route:
+                                          cluster: auth
+                                          prefix_rewrite: /.well-known/jwks.json
+                                          timeout: 30s
+                                        request_headers_to_add:
+                                          - header:
+                                              key: X-Forwarded-Prefix
+                                              value: /auth/v1/.well-known/jwks.json
+                                            append_action: ADD_IF_ABSENT
+                                        typed_per_filter_config:
+                                          envoy.filters.http.rbac:
+                                            '@type': type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBACPerRoute
+                                            rbac:
+                                              rules:
+                                                action: ALLOW
+                                                policies:
+                                                  allow_all:
+                                                    permissions:
+                                                      - any: true
+                                                    principals:
+                                                      - any: true
+                                      - match:
+                                          prefix: /auth/v1/.well-known/oauth-authorization-server
+                                        route:
+                                          cluster: auth
+                                          prefix_rewrite: /.well-known/oauth-authorization-server
+                                          timeout: 30s
+                                        request_headers_to_add:
+                                          - header:
+                                              key: X-Forwarded-Prefix
+                                              value: /auth/v1/.well-known/oauth-authorization-server
+                                            append_action: ADD_IF_ABSENT
+                                        typed_per_filter_config:
+                                          envoy.filters.http.rbac:
+                                            '@type': type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBACPerRoute
+                                            rbac:
+                                              rules:
+                                                action: ALLOW
+                                                policies:
+                                                  allow_all:
+                                                    permissions:
+                                                      - any: true
+                                                    principals:
+                                                      - any: true
+                                      - match:
+                                          prefix: /auth/v1/.well-known/openid-configuration
+                                        route:
+                                          cluster: auth
+                                          prefix_rewrite: /.well-known/openid-configuration
+                                          timeout: 30s
+                                        request_headers_to_add:
+                                          - header:
+                                              key: X-Forwarded-Prefix
+                                              value: /auth/v1/.well-known/openid-configuration
+                                            append_action: ADD_IF_ABSENT
+                                        typed_per_filter_config:
+                                          envoy.filters.http.rbac:
+                                            '@type': type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBACPerRoute
+                                            rbac:
+                                              rules:
+                                                action: ALLOW
+                                                policies:
+                                                  allow_all:
+                                                    permissions:
+                                                      - any: true
+                                                    principals:
+                                                      - any: true
+                                      - match:
+                                          path: /.well-known/oauth-authorization-server/auth/v1
+                                        route:
+                                          cluster: auth
+                                          prefix_rewrite: /.well-known/oauth-authorization-server
+                                          timeout: 30s
+                                        request_headers_to_add:
+                                          - header:
+                                              key: X-Forwarded-Prefix
+                                              value: /.well-known/oauth-authorization-server/auth/v1
+                                            append_action: ADD_IF_ABSENT
+                                        typed_per_filter_config:
+                                          envoy.filters.http.rbac:
+                                            '@type': type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBACPerRoute
+                                            rbac:
+                                              rules:
+                                                action: ALLOW
+                                                policies:
+                                                  allow_all:
+                                                    permissions:
+                                                      - any: true
+                                                    principals:
+                                                      - any: true
+                                      - match:
+                                          prefix: /auth/v1/sso/saml/acs
+                                        route:
+                                          cluster: auth
+                                          prefix_rewrite: /sso/saml/acs
+                                          timeout: 30s
+                                        request_headers_to_add:
+                                          - header:
+                                              key: X-Forwarded-Prefix
+                                              value: /auth/v1/sso/saml/acs
+                                            append_action: ADD_IF_ABSENT
+                                        typed_per_filter_config:
+                                          envoy.filters.http.rbac:
+                                            '@type': type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBACPerRoute
+                                            rbac:
+                                              rules:
+                                                action: ALLOW
+                                                policies:
+                                                  allow_all:
+                                                    permissions:
+                                                      - any: true
+                                                    principals:
+                                                      - any: true
+                                      - match:
+                                          prefix: /auth/v1/sso/saml/metadata
+                                        route:
+                                          cluster: auth
+                                          prefix_rewrite: /sso/saml/metadata
+                                          timeout: 30s
+                                        request_headers_to_add:
+                                          - header:
+                                              key: X-Forwarded-Prefix
+                                              value: /auth/v1/sso/saml/metadata
+                                            append_action: ADD_IF_ABSENT
+                                        typed_per_filter_config:
+                                          envoy.filters.http.rbac:
+                                            '@type': type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBACPerRoute
+                                            rbac:
+                                              rules:
+                                                action: ALLOW
+                                                policies:
+                                                  allow_all:
+                                                    permissions:
+                                                      - any: true
+                                                    principals:
+                                                      - any: true
+                                      - match:
+                                          prefix: /storage/v1/
+                                        route:
+                                          cluster: storage
+                                          prefix_rewrite: /
+                                          timeout: 30s
+                                        request_headers_to_add:
+                                          - header:
+                                              key: X-Forwarded-Prefix
+                                              value: /storage/v1
+                                            append_action: ADD_IF_ABSENT
+                                        typed_per_filter_config:
+                                          envoy.filters.http.rbac:
+                                            '@type': type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBACPerRoute
+                                            rbac:
+                                              rules:
+                                                action: ALLOW
+                                                policies:
+                                                  allow_all:
+                                                    permissions:
+                                                      - any: true
+                                                    principals:
+                                                      - any: true
+                                      - name: auth-v1-protected
+                                        match:
+                                          prefix: /auth/v1/
+                                        route:
+                                          cluster: auth
+                                          prefix_rewrite: /
+                                          timeout: 30s
+                                        request_headers_to_add:
+                                          - header:
+                                              key: X-Forwarded-Prefix
+                                              value: /auth/v1/
+                                            append_action: ADD_IF_ABSENT
+                                        typed_per_filter_config: {}
+                                      - name: rest-v1-openapi-protected
+                                        match:
+                                          path: /rest/v1/
+                                        route:
+                                          cluster: rest
+                                          prefix_rewrite: /
+                                          timeout: 30s
+                                        request_headers_to_add:
+                                          - header:
+                                              key: X-Forwarded-Prefix
+                                              value: /rest/v1/
+                                            append_action: ADD_IF_ABSENT
+                                        typed_per_filter_config:
+                                          envoy.filters.http.rbac:
+                                            '@type': type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBACPerRoute
+                                            rbac:
+                                              rules:
+                                                action: ALLOW
+                                                policies:
+                                                  admin:
+                                                    permissions:
+                                                      - any: true
+                                                    principals:
+                                                      - header:
+                                                          name: apikey
+                                                          string_match:
+                                                            exact: ${SERVICE_ROLE_KEY}
+                                                      - header:
+                                                          name: apikey
+                                                          string_match:
+                                                            exact: ${SERVICE_ROLE_KEY_ASYMMETRIC}
+                                      - name: rest-v1-protected
+                                        match:
+                                          prefix: /rest/v1/
+                                        route:
+                                          cluster: rest
+                                          prefix_rewrite: /
+                                          timeout: 30s
+                                        request_headers_to_add:
+                                          - header:
+                                              key: X-Forwarded-Prefix
+                                              value: /rest/v1/
+                                            append_action: ADD_IF_ABSENT
+                                        typed_per_filter_config: {}
+                                      - match:
+                                          prefix: /
+                                        direct_response:
+                                          status: 404
+                                        typed_per_filter_config: *public_access
+                              http_filters:
+                                - name: envoy.filters.http.cors
+                                  typed_config:
+                                    '@type': type.googleapis.com/envoy.extensions.filters.http.cors.v3.Cors
+                                - name: envoy.filters.http.lua
+                                  typed_config:
+                                    '@type': type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+                                    inline_code: |
+                                      function envoy_on_request(request_handle)
+                                        local headers = request_handle:headers()
+                                        if headers:get("apikey") ~= nil then
+                                          return
+                                        end
+
+                                        local path = headers:get(":path")
+                                        local query_start = string.find(path, "?", 1, true)
+                                        if query_start == nil then
+                                          return
+                                        end
+
+                                        local query = string.sub(path, query_start + 1)
+                                        for key, value in string.gmatch(query, "([^&]+)=([^&]*)") do
+                                          if key == "apikey" and value ~= "" then
+                                            headers:add("apikey", value)
+                                            return
+                                          end
+                                        end
+                                      end
+                                - name: envoy.filters.http.lua
+                                  typed_config:
+                                    '@type': type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+                                    inline_code: |
+                                      local ANON_KEY = "${ANON_KEY}"
+                                      local SERVICE_ROLE_KEY = "${SERVICE_ROLE_KEY}"
+                                      local SUPABASE_PUBLISHABLE_KEY = "${SUPABASE_PUBLISHABLE_KEY}"
+                                      local SUPABASE_SECRET_KEY = "${SUPABASE_SECRET_KEY}"
+                                      local ANON_KEY_ASYMMETRIC = "${ANON_KEY_ASYMMETRIC}"
+                                      local SERVICE_ROLE_KEY_ASYMMETRIC = "${SERVICE_ROLE_KEY_ASYMMETRIC}"
+                                      local TRANSLATION_ENABLED = SUPABASE_SECRET_KEY ~= "" and SUPABASE_PUBLISHABLE_KEY ~= "" and SERVICE_ROLE_KEY_ASYMMETRIC ~= "" and ANON_KEY_ASYMMETRIC ~= ""
+
+                                      local PROTECTED_ROUTES = {
+                                        ["auth-v1-protected"] = true,
+                                        ["rest-v1-openapi-protected"] = true,
+                                        ["rest-v1-protected"] = true,
+                                      }
+
+                                      local function is_protected_route(route_name)
+                                        if route_name == nil or route_name == "" then
+                                          return false
+                                        end
+
+                                        return PROTECTED_ROUTES[route_name] == true
+                                      end
+
+                                      local function is_valid_apikey(apikey)
+                                        if apikey == nil or apikey == "" then
+                                          return false
+                                        end
+
+                                        if SERVICE_ROLE_KEY ~= "" and apikey == SERVICE_ROLE_KEY then
+                                          return true
+                                        end
+
+                                        if ANON_KEY ~= "" and apikey == ANON_KEY then
+                                          return true
+                                        end
+
+                                        if TRANSLATION_ENABLED and apikey == SUPABASE_SECRET_KEY then
+                                          return true
+                                        end
+
+                                        if TRANSLATION_ENABLED and apikey == SUPABASE_PUBLISHABLE_KEY then
+                                          return true
+                                        end
+
+                                        return false
+                                      end
+
+                                      function envoy_on_request(request_handle)
+                                        local headers = request_handle:headers()
+                                        local route_name = request_handle:streamInfo():routeName()
+                                        if not is_protected_route(route_name) then
+                                          return
+                                        end
+
+                                        if is_valid_apikey(headers:get("apikey")) then
+                                          return
+                                        end
+
+                                        request_handle:respond({
+                                          [":status"] = "401",
+                                          ["content-type"] = "text/plain",
+                                        }, "Unauthorized")
+                                      end
+                                - name: envoy.filters.http.lua
+                                  typed_config:
+                                    '@type': type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+                                    inline_code: |
+                                      local SECRET_KEY = "${SUPABASE_SECRET_KEY}"
+                                      local PUBLISHABLE_KEY = "${SUPABASE_PUBLISHABLE_KEY}"
+                                      local SERVICE_ROLE_JWT = "${SERVICE_ROLE_KEY_ASYMMETRIC}"
+                                      local ANON_JWT = "${ANON_KEY_ASYMMETRIC}"
+                                      local TRANSLATION_ENABLED = SECRET_KEY ~= "" and PUBLISHABLE_KEY ~= "" and SERVICE_ROLE_JWT ~= "" and ANON_JWT ~= ""
+
+                                      local function translate_apikey(apikey)
+                                        if apikey == nil or apikey == "" then
+                                          return nil
+                                        end
+
+                                        if not TRANSLATION_ENABLED then
+                                          return nil
+                                        end
+
+                                        if apikey == SECRET_KEY then
+                                          return SERVICE_ROLE_JWT
+                                        end
+
+                                        if apikey == PUBLISHABLE_KEY then
+                                          return ANON_JWT
+                                        end
+
+                                        return nil
+                                      end
+
+                                      local function extract_query_apikey(path)
+                                        if path == nil or path == "" then
+                                          return nil
+                                        end
+
+                                        local query_start = string.find(path, "?", 1, true)
+                                        if query_start == nil then
+                                          return nil
+                                        end
+
+                                        local query = string.sub(path, query_start + 1)
+                                        for key, value in string.gmatch(query, "([^&]+)=([^&]*)") do
+                                          if key == "apikey" and value ~= "" then
+                                            return value
+                                          end
+                                        end
+
+                                        return nil
+                                      end
+
+                                      local function replace_query_apikey(path, new_value)
+                                        if path == nil or path == "" or new_value == nil or new_value == "" then
+                                          return nil
+                                        end
+
+                                        local query_start = string.find(path, "?", 1, true)
+                                        if query_start == nil then
+                                          return nil
+                                        end
+
+                                        local base = string.sub(path, 1, query_start)
+                                        local query = string.sub(path, query_start + 1)
+                                        local updated = {}
+                                        local replaced = false
+
+                                        for part in string.gmatch(query, "([^&]+)") do
+                                          local key, value = string.match(part, "([^=]+)=(.*)")
+                                          if key == "apikey" then
+                                            part = key .. "=" .. new_value
+                                            replaced = true
+                                          end
+                                          table.insert(updated, part)
+                                        end
+
+                                        if not replaced then
+                                          return nil
+                                        end
+
+                                        return base .. table.concat(updated, "&")
+                                      end
+
+                                      function envoy_on_request(request_handle)
+                                        local headers = request_handle:headers()
+                                        local path = headers:get(":path")
+                                        local apikey = extract_query_apikey(path)
+                                        local translated = translate_apikey(apikey)
+
+                                        if translated == nil then
+                                          return
+                                        end
+
+                                        headers:replace("apikey", translated)
+
+                                        local rewritten_path = replace_query_apikey(path, translated)
+                                        if rewritten_path ~= nil then
+                                          headers:replace(":path", rewritten_path)
+                                        end
+                                      end
+                                - name: envoy.filters.http.lua
+                                  typed_config:
+                                    '@type': type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+                                    inline_code: |
+                                      local SECRET_KEY = "${SUPABASE_SECRET_KEY}"
+                                      local PUBLISHABLE_KEY = "${SUPABASE_PUBLISHABLE_KEY}"
+                                      local SERVICE_ROLE_JWT = "${SERVICE_ROLE_KEY_ASYMMETRIC}"
+                                      local ANON_JWT = "${ANON_KEY_ASYMMETRIC}"
+                                      local TRANSLATION_ENABLED = SECRET_KEY ~= "" and PUBLISHABLE_KEY ~= "" and SERVICE_ROLE_JWT ~= "" and ANON_JWT ~= ""
+
+                                      local function translate_apikey(apikey)
+                                        if apikey == nil or apikey == "" then
+                                          return nil
+                                        end
+
+                                        if not TRANSLATION_ENABLED then
+                                          return nil
+                                        end
+
+                                        if apikey == SECRET_KEY then
+                                          return SERVICE_ROLE_JWT
+                                        end
+
+                                        if apikey == PUBLISHABLE_KEY then
+                                          return ANON_JWT
+                                        end
+
+                                        return nil
+                                      end
+
+                                      function envoy_on_request(request_handle)
+                                        local headers = request_handle:headers()
+                                        local translated = translate_apikey(headers:get("apikey"))
+                                        if translated ~= nil and translated ~= "" then
+                                          headers:replace("apikey", translated)
+                                        end
+                                      end
+                                - name: envoy.filters.http.lua
+                                  typed_config:
+                                    '@type': type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+                                    inline_code: |
+                                      local function has_real_jwt(auth_header)
+                                        if auth_header == nil or auth_header == "" then
+                                          return false
+                                        end
+
+                                        if string.sub(auth_header, 1, 7) ~= "Bearer " then
+                                          return false
+                                        end
+
+                                        return string.sub(auth_header, 1, 10) ~= "Bearer sb_"
+                                      end
+
+                                      local function format_authorization(value)
+                                        if value == nil or value == "" then
+                                          return nil
+                                        end
+
+                                        if string.sub(value, 1, 7) == "Bearer " then
+                                          return value
+                                        end
+
+                                        return "Bearer " .. value
+                                      end
+
+                                      function envoy_on_request(request_handle)
+                                        local headers = request_handle:headers()
+                                        if has_real_jwt(headers:get("authorization")) then
+                                          return
+                                        end
+
+                                        local apikey = headers:get("apikey")
+                                        local authorization_value = format_authorization(apikey)
+                                        if authorization_value ~= nil then
+                                          headers:replace("authorization", authorization_value)
+                                        end
+                                      end
+                                - name: envoy.filters.http.rbac
+                                  typed_config:
+                                    '@type': type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBAC
+                                    rules:
+                                      action: ALLOW
+                                      policies:
+                                        admin:
+                                          permissions:
+                                            - url_path:
+                                                path:
+                                                  prefix: /pg/
+                                          principals:
+                                            - header:
+                                                name: apikey
+                                                string_match:
+                                                  exact: ${SERVICE_ROLE_KEY}
+                                            - header:
+                                                name: apikey
+                                                string_match:
+                                                  exact: ${SERVICE_ROLE_KEY_ASYMMETRIC}
+                                        apikey:
+                                          permissions:
+                                            - url_path:
+                                                path:
+                                                  prefix: /auth/v1/
+                                            - url_path:
+                                                path:
+                                                  prefix: /rest/v1/
+                                            - url_path:
+                                                path:
+                                                  prefix: /realtime/v1/api
+                                            - url_path:
+                                                path:
+                                                  prefix: /realtime/v1/
+                                            - url_path:
+                                                path:
+                                                  prefix: /graphql/v1
+                                          principals:
+                                            - header:
+                                                name: apikey
+                                                string_match:
+                                                  exact: ${SERVICE_ROLE_KEY}
+                                            - header:
+                                                name: apikey
+                                                string_match:
+                                                  exact: ${ANON_KEY}
+                                            - header:
+                                                name: apikey
+                                                string_match:
+                                                  exact: ${SERVICE_ROLE_KEY_ASYMMETRIC}
+                                            - header:
+                                                name: apikey
+                                                string_match:
+                                                  exact: ${ANON_KEY_ASYMMETRIC}
+                                - name: envoy.filters.http.router
+                                  typed_config:
+                                    '@type': type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                              xff_num_trusted_hops: 1
+          Secrets:
+            - Name: ANON_KEY
+              ValueFrom: !Sub '${ApiSecret}:ANON_KEY::'
+            - Name: SERVICE_ROLE_KEY
+              ValueFrom: !Sub '${ApiSecret}:SERVICE_ROLE_KEY::'
+            - Name: ANON_KEY_ASYMMETRIC
+              ValueFrom: !Sub '${ApiSecret}:ANON_KEY_ASYMMETRIC::'
+            - Name: SERVICE_ROLE_KEY_ASYMMETRIC
+              ValueFrom: !Sub '${ApiSecret}:SERVICE_ROLE_KEY_ASYMMETRIC::'
+            - Name: SUPABASE_PUBLISHABLE_KEY
+              ValueFrom: !Sub '${ApiSecret}:SUPABASE_PUBLISHABLE_KEY::'
+            - Name: SUPABASE_SECRET_KEY
+              ValueFrom: !Sub '${ApiSecret}:SUPABASE_SECRET_KEY::'
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - timeout 2 bash -c '</dev/tcp/127.0.0.1/8000'
+            Interval: 15
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+          Essential: true
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref 'LogGroup'
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: gateway
+              mode: non-blocking
+              max-buffer-size: 10m
+          LinuxParameters:
+            InitProcessEnabled: true
+          StopTimeout: 60
+  GatewayDiscovery:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: gateway
+      NamespaceId: !Ref 'Namespace'
+      DnsConfig:
+        DnsRecords:
+          - Type: A
+            TTL: 10
+        RoutingPolicy: MULTIVALUE
+      HealthCheckCustomConfig:
+        FailureThreshold: 1
+  GatewayService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref 'Cluster'
+      TaskDefinition: !Ref 'GatewayTask'
+      DesiredCount: !Ref 'GatewayMinTasks'
+      LaunchType: FARGATE
+      PlatformVersion: 1.4.0
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: !Ref 'PrivateSubnetIds'
+          SecurityGroups:
+            - !Ref 'GatewaySG'
+      ServiceRegistries:
+        - RegistryArn: !GetAtt 'GatewayDiscovery.Arn'
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      AvailabilityZoneRebalancing: ENABLED
+      EnableECSManagedTags: true
+      LoadBalancers:
+        - ContainerName: gateway
+          ContainerPort: 8000
+          TargetGroupArn: !Ref 'GatewayTargets'
+      HealthCheckGracePeriodSeconds: 90
+    DependsOn:
+      - Bootstrap
+      - ApiListener
+      - AuthService
+      - RestService
+      - StorageService
+  GatewayScaling:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MinCapacity: !Ref 'GatewayMinTasks'
+      MaxCapacity: !Ref 'GatewayMaxTasks'
+      ResourceId: !Join
+        - /
+        - - service
+          - !Ref 'Cluster'
+          - !GetAtt 'GatewayService.Name'
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+  GatewayScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: GatewayCpu
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref 'GatewayScaling'
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 60
+        ScaleInCooldown: 300
+        ScaleOutCooldown: 60
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+  AuthTask:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Cpu: !Ref 'AuthCpu'
+      Memory: !Ref 'AuthMemory'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !GetAtt 'AuthExecutionRole.Arn'
+      TaskRoleArn: !GetAtt 'CertificatesRole.Arn'
+      ContainerDefinitions:
+        - Name: certificates
+          Image: public.ecr.aws/aws-cli/aws-cli:2.36.14@sha256:72180b996fad939e764434d9a69a9512ed699a061cd5db198feeb2e9533fd750
+          Essential: false
+          Command:
+            - s3
+            - cp
+            - !Sub 's3://${ArtifactsBucket}/${CertificateKey}'
+            - /shared/rds-ca.pem
+            - --only-show-errors
+          MountPoints:
+            - SourceVolume: certificates
+              ContainerPath: /shared
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref 'LogGroup'
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: certificates
+              mode: non-blocking
+              max-buffer-size: 10m
+        - Name: auth
+          Image: supabase/gotrue:v2.197.0@sha256:1736a63078f5922b198c4cbe50f80ab9a2d3b54fe8b7b6cfb2e9dc5dbbc12c6b
+          PortMappings:
+            - ContainerPort: 9999
+          Environment:
+            - Name: GOTRUE_API_HOST
+              Value: 0.0.0.0
+            - Name: GOTRUE_API_PORT
+              Value: '9999'
+            - Name: API_EXTERNAL_URL
+              Value: !Sub 'https://${ApiDomainName}'
+            - Name: GOTRUE_SITE_URL
+              Value: !Ref 'SiteUrl'
+            - Name: GOTRUE_URI_ALLOW_LIST
+              Value: !Ref 'AdditionalRedirectUrls'
+            - Name: GOTRUE_DISABLE_SIGNUP
+              Value: !Ref 'DisableSignup'
+            - Name: GOTRUE_DB_DRIVER
+              Value: postgres
+            - Name: GOTRUE_DB_MAX_POOL_SIZE
+              Value: '5'
+            - Name: GOTRUE_JWT_AUD
+              Value: authenticated
+            - Name: GOTRUE_JWT_DEFAULT_GROUP_NAME
+              Value: authenticated
+            - Name: GOTRUE_JWT_ADMIN_ROLES
+              Value: service_role
+            - Name: GOTRUE_JWT_EXP
+              Value: '3600'
+            - Name: GOTRUE_JWT_ISSUER
+              Value: !Sub 'https://${ApiDomainName}/auth/v1'
+            - Name: GOTRUE_EXTERNAL_EMAIL_ENABLED
+              Value: 'true'
+            - Name: GOTRUE_EXTERNAL_PHONE_ENABLED
+              Value: 'false'
+            - Name: GOTRUE_EXTERNAL_ANONYMOUS_USERS_ENABLED
+              Value: 'false'
+            - Name: GOTRUE_MAILER_AUTOCONFIRM
+              Value: 'false'
+            - Name: GOTRUE_SMTP_HOST
+              Value: !Sub 'email-smtp.${SesRegion}.${AWS::URLSuffix}'
+            - Name: GOTRUE_SMTP_PORT
+              Value: '587'
+            - Name: GOTRUE_SMTP_ADMIN_EMAIL
+              Value: !Ref 'SesSenderEmail'
+            - Name: GOTRUE_SMTP_SENDER_NAME
+              Value: Supabase
+            - Name: GOTRUE_MAILER_URLPATHS_INVITE
+              Value: /auth/v1/verify
+            - Name: GOTRUE_MAILER_URLPATHS_CONFIRMATION
+              Value: /auth/v1/verify
+            - Name: GOTRUE_MAILER_URLPATHS_RECOVERY
+              Value: /auth/v1/verify
+            - Name: GOTRUE_MAILER_URLPATHS_EMAIL_CHANGE
+              Value: /auth/v1/verify
+            - Name: GOTRUE_MFA_TOTP_ENROLL_ENABLED
+              Value: 'true'
+            - Name: GOTRUE_MFA_TOTP_VERIFY_ENABLED
+              Value: 'true'
+          Secrets:
+            - Name: GOTRUE_DB_DATABASE_URL
+              ValueFrom: !Sub '${AuthSecret}:uri::'
+            - Name: GOTRUE_JWT_SECRET
+              ValueFrom: !Sub '${ApiSecret}:JWT_SECRET::'
+            - Name: GOTRUE_JWT_KEYS
+              ValueFrom: !Sub '${ApiSecret}:JWT_KEYS::'
+            - Name: GOTRUE_SMTP_USER
+              ValueFrom: !Sub '${SesSmtpSecretArn}:username::'
+            - Name: GOTRUE_SMTP_PASS
+              ValueFrom: !Sub '${SesSmtpSecretArn}:password::'
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - wget --quiet --spider http://localhost:9999/health
+            Interval: 15
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+          Essential: true
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref 'LogGroup'
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: auth
+              mode: non-blocking
+              max-buffer-size: 10m
+          LinuxParameters:
+            InitProcessEnabled: true
+          StopTimeout: 60
+          DependsOn:
+            - ContainerName: certificates
+              Condition: SUCCESS
+          MountPoints:
+            - SourceVolume: certificates
+              ContainerPath: /certs
+              ReadOnly: true
+      Volumes:
+        - Name: certificates
+  AuthDiscovery:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: auth
+      NamespaceId: !Ref 'Namespace'
+      DnsConfig:
+        DnsRecords:
+          - Type: A
+            TTL: 10
+        RoutingPolicy: MULTIVALUE
+      HealthCheckCustomConfig:
+        FailureThreshold: 1
+  AuthService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref 'Cluster'
+      TaskDefinition: !Ref 'AuthTask'
+      DesiredCount: !Ref 'AuthMinTasks'
+      LaunchType: FARGATE
+      PlatformVersion: 1.4.0
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: !Ref 'PrivateSubnetIds'
+          SecurityGroups:
+            - !Ref 'AuthSG'
+      ServiceRegistries:
+        - RegistryArn: !GetAtt 'AuthDiscovery.Arn'
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      AvailabilityZoneRebalancing: ENABLED
+      EnableECSManagedTags: true
+    DependsOn:
+      - Bootstrap
+  AuthScaling:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MinCapacity: !Ref 'AuthMinTasks'
+      MaxCapacity: !Ref 'AuthMaxTasks'
+      ResourceId: !Join
+        - /
+        - - service
+          - !Ref 'Cluster'
+          - !GetAtt 'AuthService.Name'
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+  AuthScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: AuthCpu
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref 'AuthScaling'
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 60
+        ScaleInCooldown: 300
+        ScaleOutCooldown: 60
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+  RestTask:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Cpu: !Ref 'RestCpu'
+      Memory: !Ref 'RestMemory'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !GetAtt 'RestExecutionRole.Arn'
+      TaskRoleArn: !GetAtt 'CertificatesRole.Arn'
+      ContainerDefinitions:
+        - Name: certificates
+          Image: public.ecr.aws/aws-cli/aws-cli:2.36.14@sha256:72180b996fad939e764434d9a69a9512ed699a061cd5db198feeb2e9533fd750
+          Essential: false
+          Command:
+            - s3
+            - cp
+            - !Sub 's3://${ArtifactsBucket}/${CertificateKey}'
+            - /shared/rds-ca.pem
+            - --only-show-errors
+          MountPoints:
+            - SourceVolume: certificates
+              ContainerPath: /shared
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref 'LogGroup'
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: certificates
+              mode: non-blocking
+              max-buffer-size: 10m
+        - Name: rest
+          Image: postgrest/postgrest:v14.18@sha256:c7cd7e265a85b05248abf53f4473fcec7e327c282d0bd0cf60f1551996d09fcf
+          PortMappings:
+            - ContainerPort: 3000
+          Environment:
+            - Name: PGRST_DB_SCHEMAS
+              Value: !Ref 'ApiSchemas'
+            - Name: PGRST_DB_ANON_ROLE
+              Value: anon
+            - Name: PGRST_DB_POOL
+              Value: '5'
+            - Name: PGRST_DB_MAX_ROWS
+              Value: '1000'
+            - Name: PGRST_DB_EXTRA_SEARCH_PATH
+              Value: public,extensions
+            - Name: PGRST_SERVER_PORT
+              Value: '3000'
+            - Name: PGRST_ADMIN_SERVER_PORT
+              Value: '3001'
+          Secrets:
+            - Name: PGRST_DB_URI
+              ValueFrom: !Sub '${RestSecret}:uri::'
+            - Name: PGRST_JWT_SECRET
+              ValueFrom: !Sub '${ApiSecret}:JWT_JWKS::'
+          Essential: true
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref 'LogGroup'
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: rest
+              mode: non-blocking
+              max-buffer-size: 10m
+          LinuxParameters:
+            InitProcessEnabled: true
+          StopTimeout: 60
+          DependsOn:
+            - ContainerName: certificates
+              Condition: SUCCESS
+          MountPoints:
+            - SourceVolume: certificates
+              ContainerPath: /certs
+              ReadOnly: true
+        - Name: readiness
+          Image: python:3.13-slim-bookworm@sha256:281d39ff02e3b389401586134ff9e6572954687822a58055ec07a60ded4e0b7f
+          Essential: true
+          EntryPoint:
+            - python
+            - -c
+          Command:
+            - import time; time.sleep(2147483647)
+          HealthCheck:
+            Command:
+              - CMD
+              - python
+              - -c
+              - import urllib.request; urllib.request.urlopen('http://localhost:3001/ready', timeout=3)
+            Interval: 15
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref 'LogGroup'
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: readiness
+              mode: non-blocking
+              max-buffer-size: 10m
+      Volumes:
+        - Name: certificates
+  RestDiscovery:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: rest
+      NamespaceId: !Ref 'Namespace'
+      DnsConfig:
+        DnsRecords:
+          - Type: A
+            TTL: 10
+        RoutingPolicy: MULTIVALUE
+      HealthCheckCustomConfig:
+        FailureThreshold: 1
+  RestService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref 'Cluster'
+      TaskDefinition: !Ref 'RestTask'
+      DesiredCount: !Ref 'RestMinTasks'
+      LaunchType: FARGATE
+      PlatformVersion: 1.4.0
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: !Ref 'PrivateSubnetIds'
+          SecurityGroups:
+            - !Ref 'RestSG'
+      ServiceRegistries:
+        - RegistryArn: !GetAtt 'RestDiscovery.Arn'
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      AvailabilityZoneRebalancing: ENABLED
+      EnableECSManagedTags: true
+    DependsOn:
+      - Bootstrap
+  RestScaling:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MinCapacity: !Ref 'RestMinTasks'
+      MaxCapacity: !Ref 'RestMaxTasks'
+      ResourceId: !Join
+        - /
+        - - service
+          - !Ref 'Cluster'
+          - !GetAtt 'RestService.Name'
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+  RestScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: RestCpu
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref 'RestScaling'
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 60
+        ScaleInCooldown: 300
+        ScaleOutCooldown: 60
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+  StorageTask:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Cpu: !Ref 'StorageCpu'
+      Memory: !Ref 'StorageMemory'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !GetAtt 'StorageExecutionRole.Arn'
+      ContainerDefinitions:
+        - Name: certificates
+          Image: public.ecr.aws/aws-cli/aws-cli:2.36.14@sha256:72180b996fad939e764434d9a69a9512ed699a061cd5db198feeb2e9533fd750
+          Essential: false
+          Command:
+            - s3
+            - cp
+            - !Sub 's3://${ArtifactsBucket}/${CertificateKey}'
+            - /shared/rds-ca.pem
+            - --only-show-errors
+          MountPoints:
+            - SourceVolume: certificates
+              ContainerPath: /shared
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref 'LogGroup'
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: certificates
+              mode: non-blocking
+              max-buffer-size: 10m
+        - Name: storage
+          Image: supabase/storage-api:v1.81.0@sha256:98ffec5d0678803783c30e404c27f4ec65e97efbe014088f2a86b4b8b54b9f54
+          PortMappings:
+            - ContainerPort: 5000
+          Environment:
+            - Name: POSTGREST_URL
+              Value: !Sub 'http://rest.${AWS::StackName}.internal:3000'
+            - Name: STORAGE_PUBLIC_URL
+              Value: !Sub 'https://${ApiDomainName}'
+            - Name: REQUEST_ALLOW_X_FORWARDED_PATH
+              Value: 'true'
+            - Name: STORAGE_BACKEND
+              Value: s3
+            - Name: DB_INSTALL_ROLES
+              Value: 'false'
+            - Name: GLOBAL_S3_BUCKET
+              Value: !Ref 'Bucket'
+            - Name: REGION
+              Value: !Ref 'AWS::Region'
+            - Name: AWS_REGION
+              Value: !Ref 'AWS::Region'
+            - Name: TENANT_ID
+              Value: !Ref 'AWS::StackName'
+            - Name: FILE_SIZE_LIMIT
+              Value: !Ref 'FileSizeLimitBytes'
+            - Name: ENABLE_IMAGE_TRANSFORMATION
+              Value: 'false'
+            - Name: S3_PROTOCOL_ENABLED
+              Value: 'false'
+            - Name: DATABASE_MAX_CONNECTIONS
+              Value: '5'
+            - Name: NODE_EXTRA_CA_CERTS
+              Value: /certs/rds-ca.pem
+          Secrets:
+            - Name: DATABASE_URL
+              ValueFrom: !Sub '${StorageSecret}:uri::'
+            - Name: AUTH_JWT_SECRET
+              ValueFrom: !Sub '${ApiSecret}:JWT_SECRET::'
+            - Name: JWT_JWKS
+              ValueFrom: !Sub '${ApiSecret}:JWT_JWKS::'
+            - Name: ANON_KEY
+              ValueFrom: !Sub '${ApiSecret}:ANON_KEY::'
+            - Name: SERVICE_KEY
+              ValueFrom: !Sub '${ApiSecret}:SERVICE_ROLE_KEY::'
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - wget --quiet --spider http://localhost:5000/status
+            Interval: 15
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+          Essential: true
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref 'LogGroup'
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: storage
+              mode: non-blocking
+              max-buffer-size: 10m
+          LinuxParameters:
+            InitProcessEnabled: true
+          StopTimeout: 60
+          DependsOn:
+            - ContainerName: certificates
+              Condition: SUCCESS
+          MountPoints:
+            - SourceVolume: certificates
+              ContainerPath: /certs
+              ReadOnly: true
+          Command:
+            - /bin/sh
+            - -c
+            - export DATABASE_SSL_ROOT_CERT="$(cat /certs/rds-ca.pem)"; exec node dist/start/server.js
+      Volumes:
+        - Name: certificates
+      TaskRoleArn: !GetAtt 'StorageRole.Arn'
+  StorageDiscovery:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: storage
+      NamespaceId: !Ref 'Namespace'
+      DnsConfig:
+        DnsRecords:
+          - Type: A
+            TTL: 10
+        RoutingPolicy: MULTIVALUE
+      HealthCheckCustomConfig:
+        FailureThreshold: 1
+  StorageService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref 'Cluster'
+      TaskDefinition: !Ref 'StorageTask'
+      DesiredCount: !Ref 'StorageMinTasks'
+      LaunchType: FARGATE
+      PlatformVersion: 1.4.0
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: !Ref 'PrivateSubnetIds'
+          SecurityGroups:
+            - !Ref 'StorageSG'
+      ServiceRegistries:
+        - RegistryArn: !GetAtt 'StorageDiscovery.Arn'
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      AvailabilityZoneRebalancing: ENABLED
+      EnableECSManagedTags: true
+    DependsOn:
+      - Bootstrap
+      - AuthService
+      - RestService
+  StorageScaling:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MinCapacity: !Ref 'StorageMinTasks'
+      MaxCapacity: !Ref 'StorageMaxTasks'
+      ResourceId: !Join
+        - /
+        - - service
+          - !Ref 'Cluster'
+          - !GetAtt 'StorageService.Name'
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+  StorageScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: StorageCpu
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref 'StorageScaling'
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 60
+        ScaleInCooldown: 300
+        ScaleOutCooldown: 60
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+  ApiAlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      Type: application
+      Subnets: !Ref 'PublicSubnetIds'
+      SecurityGroups:
+        - !Ref 'ApiAlbSG'
+      LoadBalancerAttributes:
+        - Key: routing.http.drop_invalid_header_fields.enabled
+          Value: 'true'
+        - Key: routing.http.desync_mitigation_mode
+          Value: strictest
+        - Key: idle_timeout.timeout_seconds
+          Value: '120'
+  GatewayTargets:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref 'VpcId'
+      TargetType: ip
+      Port: 8000
+      Protocol: HTTP
+      HealthCheckPath: /healthz
+      Matcher:
+        HttpCode: '200'
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '60'
+  ApiListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref 'ApiAlb'
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref 'CertificateArn'
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref 'GatewayTargets'
+  ApiDns:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref 'HostedZoneId'
+      Name: !Ref 'ApiDomainName'
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt 'ApiAlb.DNSName'
+        HostedZoneId: !GetAtt 'ApiAlb.CanonicalHostedZoneID'
+    Condition: CreateDns
+  AdminTask:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Cpu: '1024'
+      Memory: '2048'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !GetAtt 'AdminExecutionRole.Arn'
+      TaskRoleArn: !GetAtt 'CertificatesRole.Arn'
+      Volumes:
+        - Name: certificates
+      ContainerDefinitions:
+        - Name: certificates
+          Image: public.ecr.aws/aws-cli/aws-cli:2.36.14@sha256:72180b996fad939e764434d9a69a9512ed699a061cd5db198feeb2e9533fd750
+          Essential: false
+          Command:
+            - s3
+            - cp
+            - !Sub 's3://${ArtifactsBucket}/${CertificateKey}'
+            - /shared/rds-ca.pem
+            - --only-show-errors
+          MountPoints:
+            - SourceVolume: certificates
+              ContainerPath: /shared
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref 'LogGroup'
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: certificates
+              mode: non-blocking
+              max-buffer-size: 10m
+        - Name: meta
+          Image: supabase/postgres-meta:v0.100.0@sha256:145325b7e39f8ef4931d6e8cfd3f6f4d655de09d72a2ccc96d9513542c2202bd
+          Essential: true
+          Memory: 1024
+          Environment:
+            - Name: PG_META_PORT
+              Value: '8080'
+            - Name: PG_META_DB_HOST
+              Value: !GetAtt 'Database.Endpoint.Address'
+            - Name: PG_META_DB_PORT
+              Value: '5432'
+            - Name: PG_META_DB_NAME
+              Value: postgres
+            - Name: PG_META_DB_USER
+              Value: postgres
+            - Name: PG_META_DB_SSL_MODE
+              Value: verify-full
+            - Name: NODE_EXTRA_CA_CERTS
+              Value: /certs/rds-ca.pem
+            - Name: NODE_OPTIONS
+              Value: --max-old-space-size=600
+          Secrets:
+            - Name: PG_META_DB_PASSWORD
+              ValueFrom: !Sub '${DatabaseSecret}:password::'
+            - Name: CRYPTO_KEY
+              ValueFrom: !Sub '${MetaSecret}:crypto_key::'
+          Command:
+            - /bin/sh
+            - -c
+            - export PG_META_DB_SSL_ROOT_CERT="$(cat /certs/rds-ca.pem)"; exec node /usr/src/app/dist/server/server.js
+          MountPoints:
+            - SourceVolume: certificates
+              ContainerPath: /certs
+              ReadOnly: true
+          DependsOn:
+            - ContainerName: certificates
+              Condition: SUCCESS
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref 'LogGroup'
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: meta
+              mode: non-blocking
+              max-buffer-size: 10m
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - node -e "fetch('http://localhost:8080/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
+            Interval: 15
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+        - Name: studio
+          Image: supabase/studio:2026.10.12-sha-3699278@sha256:948770ec467f00e6ae34c35018ef7cb23d7b30eb806b42c2cc0d7bcfdcf8a7a8
+          Essential: true
+          PortMappings:
+            - ContainerPort: 3000
+          DependsOn:
+            - ContainerName: meta
+              Condition: HEALTHY
+          Environment:
+            - Name: HOSTNAME
+              Value: 0.0.0.0
+            - Name: STUDIO_PG_META_URL
+              Value: http://localhost:8080
+            - Name: POSTGRES_HOST
+              Value: !GetAtt 'Database.Endpoint.Address'
+            - Name: POSTGRES_PORT
+              Value: '5432'
+            - Name: POSTGRES_DB
+              Value: postgres
+            - Name: POSTGRES_USER_READ_WRITE
+              Value: postgres
+            - Name: SUPABASE_URL
+              Value: !Sub 'http://gateway.${AWS::StackName}.internal:8000'
+            - Name: SUPABASE_PUBLIC_URL
+              Value: !Sub 'https://${ApiDomainName}'
+            - Name: DEFAULT_ORGANIZATION_NAME
+              Value: Self-hosted
+            - Name: DEFAULT_PROJECT_NAME
+              Value: !Ref 'AWS::StackName'
+            - Name: PGRST_DB_SCHEMAS
+              Value: !Ref 'ApiSchemas'
+            - Name: ENABLED_FEATURES_LOGS_ALL
+              Value: 'false'
+          Secrets:
+            - Name: POSTGRES_PASSWORD
+              ValueFrom: !Sub '${DatabaseSecret}:password::'
+            - Name: PG_META_CRYPTO_KEY
+              ValueFrom: !Sub '${MetaSecret}:crypto_key::'
+            - Name: AUTH_JWT_SECRET
+              ValueFrom: !Sub '${ApiSecret}:JWT_SECRET::'
+            - Name: SUPABASE_ANON_KEY
+              ValueFrom: !Sub '${ApiSecret}:ANON_KEY::'
+            - Name: SUPABASE_SERVICE_KEY
+              ValueFrom: !Sub '${ApiSecret}:SERVICE_ROLE_KEY::'
+            - Name: SUPABASE_PUBLISHABLE_KEY
+              ValueFrom: !Sub '${ApiSecret}:SUPABASE_PUBLISHABLE_KEY::'
+            - Name: SUPABASE_SECRET_KEY
+              ValueFrom: !Sub '${ApiSecret}:SUPABASE_SECRET_KEY::'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref 'LogGroup'
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: studio
+              mode: non-blocking
+              max-buffer-size: 10m
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - node -e "fetch('http://localhost:3000/api/platform/profile').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
+            Interval: 15
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+    Condition: RunStudio
+  AdminAlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internal
+      Type: application
+      Subnets: !Ref 'PrivateSubnetIds'
+      SecurityGroups:
+        - !Ref 'AdminAlbSG'
+    Condition: RunStudio
+  AdminTargets:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref 'VpcId'
+      TargetType: ip
+      Port: 3000
+      Protocol: HTTP
+      HealthCheckPath: /api/platform/profile
+      Matcher:
+        HttpCode: '200'
+    Condition: RunStudio
+  AdminListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref 'AdminAlb'
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref 'CertificateArn'
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref 'AdminTargets'
+    Condition: RunStudio
+  AdminService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref 'Cluster'
+      TaskDefinition: !Ref 'AdminTask'
+      DesiredCount: 1
+      LaunchType: FARGATE
+      PlatformVersion: 1.4.0
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: !Ref 'PrivateSubnetIds'
+          SecurityGroups:
+            - !Ref 'AdminSG'
+      HealthCheckGracePeriodSeconds: 120
+      LoadBalancers:
+        - ContainerName: studio
+          ContainerPort: 3000
+          TargetGroupArn: !Ref 'AdminTargets'
+      DeploymentConfiguration:
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+    DependsOn:
+      - Bootstrap
+      - GatewayService
+      - AdminListener
+    Condition: RunStudio
+  DatabaseStorageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Investigate FreeStorageSpace
+      Namespace: AWS/RDS
+      MetricName: FreeStorageSpace
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref 'Database'
+      Statistic: Minimum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5368709120
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If
+        - HasAlarmTopic
+        - - !Ref 'AlarmTopicArn'
+        - !Ref 'AWS::NoValue'
+  DatabaseCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Investigate CPUUtilization
+      Namespace: AWS/RDS
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref 'Database'
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If
+        - HasAlarmTopic
+        - - !Ref 'AlarmTopicArn'
+        - !Ref 'AWS::NoValue'
+  ApiErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Investigate HTTPCode_Target_5XX_Count
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !GetAtt 'ApiAlb.LoadBalancerFullName'
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If
+        - HasAlarmTopic
+        - - !Ref 'AlarmTopicArn'
+        - !Ref 'AWS::NoValue'
+Outputs:
+  ApiUrl:
+    Value: !Sub 'https://${ApiDomainName}'
+  ApiLoadBalancerDnsName:
+    Value: !GetAtt 'ApiAlb.DNSName'
+  DatabaseEndpoint:
+    Value: !GetAtt 'Database.Endpoint.Address'
+  DatabaseSecretArn:
+    Value: !Ref 'DatabaseSecret'
+  ApiSecretArn:
+    Value: !Ref 'ApiSecret'
+  StorageBucketName:
+    Value: !Ref 'Bucket'
+  ClusterName:
+    Value: !Ref 'Cluster'
+  LogGroupName:
+    Value: !Ref 'LogGroup'
+  StudioUrl:
+    Value: !Sub 'https://${StudioDomainName}'
+    Condition: RunStudio
+  StudioLoadBalancerDnsName:
+    Value: !GetAtt 'AdminAlb.DNSName'
+    Condition: RunStudio
+Rules:
+  StudioRequiresHostname:
+    RuleCondition: !Equals
+      - !Ref 'EnableStudio'
+      - 'true'
+    Assertions:
+      - Assert: !Not
+          - !Equals
+            - !Ref 'StudioDomainName'
+            - ''
+        AssertDescription: Provide StudioDomainName covered by CertificateArn when enabling Studio.

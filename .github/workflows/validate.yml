@@ -1,0 +1,32 @@
+name: Validate
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '17 8 * * 1'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.13'
+      - run: python -m pip install --require-hashes -r tests/requirements.txt
+      - run: shellcheck src/deploy.sh src/gateway-entrypoint.sh
+      - run: ./src/deploy.sh --template > /tmp/supabase.yaml && cfn-lint /tmp/supabase.yaml
+      - run: python -m unittest discover -s tests -p 'test_*.py'
+      - run: pip-audit -r tests/requirements.txt --disable-pip --no-deps
+      - run: ./src/deploy.sh --package /tmp/bootstrap.zip
+      - name: Docker and Moto integration (no AWS provisioning)
+        run: python tests/integration.py /tmp/bootstrap.zip
+      - name: Review upstream self-hosted release
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        env:
+          CHECK_SUPABASE_RELEASE: '1'
+        run: python -m unittest discover -s tests -p test_deploy.py -k ReleaseTest
