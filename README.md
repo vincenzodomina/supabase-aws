@@ -83,7 +83,7 @@ Studio snippets are ephemeral across task replacement. Store durable schema chan
 | Administration | Disabled; one combined task when enabled |
 | Database | RDS PostgreSQL 17.6, `db.t4g.medium`, Multi-AZ, encrypted gp3 |
 | Database backups | 14 days; deletion protection; snapshot on delete/replacement |
-| Objects | Private encrypted S3 bucket with versioning and retention on stack deletion |
+| Objects | Private encrypted S3 bucket with versioning; bucket and HTTPS-only policy retained on deletion; incomplete multipart uploads aborted after seven days |
 | Authentication | Email confirmation required; public signups disabled; TOTP MFA enabled |
 | API keys | Opaque publishable/secret keys, ES256 session signing, legacy compatibility keys |
 | Database connections | Separate role passwords; TLS with RDS CA verification |
