@@ -33,7 +33,7 @@ jq --arg revision "$(date -u +%Y%m%dT%H%M%SZ)" '.CredentialRevision=$revision' \
   --parameters "$rotation_dir/parameters.json" --artifacts-bucket "$artifacts_bucket"
 ```
 
-Review the returned change set and record its full ARN as `change_set`. Expect bootstrap refresh and all enabled ECS services to update, with no database replacement. Secret contents are fetched at execution/task launch, not pinned by the reviewed change set; freeze secret writes throughout the operation. Supply the existing profile/execution role as required by the deployment.
+Review the returned change set as a preview. The later `--apply` command generates a fresh change set from the supplied files; keep the checkout, artifacts, and parameter file unchanged between preview and deployment. Expect bootstrap refresh and all enabled ECS services to update, with no database replacement. Secret contents are fetched at execution/task launch, not pinned by the reviewed change set; freeze secret writes throughout the operation. Supply the existing profile/execution role as required by the deployment.
 
 Select one secret below, then save its current complete JSON object:
 
@@ -126,12 +126,13 @@ Keep the complete bundle privileged: `JWT_JWKS` also contains the legacy symmetr
 
 ## Publish, refresh, and verify
 
-After the selected preparation and any master-password verification, publish and execute the already-reviewed change set:
+After the selected preparation and any master-password verification, publish the secret and deploy using the same source and parameter file:
 
 ```bash
 aws secretsmanager put-secret-value --region "$secret_region" --secret-id "$secret" \
   --secret-string "file://$rotation_dir/next.json" --query VersionId --output text
-./src/deploy.sh --stack-name "$stack" --region "$AWS_REGION" --change-set "$change_set" --apply
+./src/deploy.sh --stack-name "$stack" --region "$AWS_REGION" \
+  --parameters "$rotation_dir/parameters.json" --artifacts-bucket "$artifacts_bucket" --apply
 ```
 
 Wait for successful stack completion and confirm every enabled service has completed its new deployment, old tasks have drained, and replica minimums are restored. Verify affected database logins, Auth login/refresh, private RLS access, an S3 upload/download/delete, and optional Studio/meta access. For opaque rotation, check that old opaque keys fail while existing sessions and legacy keys still work. For signing rotation, check old access tokens fail and new tokens work. Verify SMTP delivery separately. These AWS checks remain manual acceptance; local Docker/Moto tests cannot establish RDS propagation, ECS rollout ordering, or SES delivery.
