@@ -32,6 +32,7 @@ This community-maintained project addresses those two core needs: RDS compatibil
 | US-08 | As an infrastructure engineer, I want a minimal set of required parameters with sensible defaults, so that I provide organization-specific choices without configuring every internal component. |
 | US-09 | As a maintainer, I want to copy a versioned release of the project's source into a consuming infrastructure repository, so that the organization can review, maintain, and deploy it independently. |
 | US-10 | As an operator, I want to review proposed infrastructure changes and receive clear deployment success or failure, so that changes remain controlled and auditable. |
+| US-41 | As an evaluator, I want an optional minimal standalone starter that supplies missing shared prerequisites and invokes the same Supabase deployment with one command, so that I can try the approach in a test AWS account before integrating it into existing infrastructure. |
 
 ## Enterprise flexibility (design preference)
 
