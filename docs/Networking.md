@@ -74,6 +74,8 @@ Reuse an [S3 gateway endpoint](https://docs.aws.amazon.com/vpc/latest/privatelin
 
 The API defaults to `ApiExposure=internal`, using the private application subnets. Set `ApiClientSecurityGroupId` to the existing security group of the consuming ECS application or other approved clients; those clients also need outbound HTTPS access. Browsers and Auth email-link users must have private network access to this endpoint. For public clients, explicitly choose `ApiExposure=internet-facing` and provide `PublicSubnetIds`.
 
+If the client stack is deployed later, set `ManageApiIngress=false` and leave `ApiClientSecurityGroupId` empty. The internal ALB then has no client ingress until the consuming infrastructure creates a TCP 443 rule from its client security group to the `ApiSecurityGroupId` output. This avoids a dependency back to the client stack. When switching an existing deployment, transfer rule ownership deliberately; removing the managed rule before its replacement is active interrupts access. This option does not change public API ingress.
+
 If `HostedZoneId` is supplied, the stack creates the API alias in that existing zone: use a private zone associated with the VPC for internal access, or a public zone for internet-facing access. Otherwise manage the corresponding DNS yourself, pointing `ApiDomainName` at `ApiLoadBalancerDnsName`. DNS must match the supplied certificate. The API is HTTPS-only.
 
 Existing public deployments must explicitly set `ApiExposure=internet-facing` to preserve their exposure. Changing the scheme replaces the ALB and updates its DNS target; review the ALB replacement and plan a client/DNS cutover before switching an existing deployment.

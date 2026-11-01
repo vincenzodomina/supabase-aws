@@ -227,21 +227,38 @@ class ArtifactTest(unittest.TestCase):
         self.assertFalse(errors)
         resources = template['Resources']
         self.assertEqual(template['Parameters']['ApiExposure']['Default'], 'internal')
+        self.assertEqual(template['Parameters']['ManageApiIngress']['Default'], 'true')
+        self.assertEqual(template['Parameters']['ManageApiIngress']['AllowedValues'], ['true', 'false'])
         self.assertEqual(resources['ApiAlb']['Properties']['Scheme'], {'Ref': 'ApiExposure'})
         public_condition = resources['PublicHttps']['Condition']
         self.assertEqual(template['Conditions'][public_condition], {'Fn::Equals': [{'Ref': 'ApiExposure'}, 'internet-facing']})
         self.assertEqual(resources['ApiAlb']['Properties']['Subnets'],
                          {'Fn::If': [public_condition, {'Ref': 'PublicSubnetIds'}, {'Ref': 'PrivateSubnetIds'}]})
         private = resources['PrivateApiHttps']
-        self.assertEqual(template['Conditions'][private['Condition']], {'Fn::Equals': [{'Ref': 'ApiExposure'}, 'internal']})
+        self.assertEqual(template['Conditions'][private['Condition']], {'Fn::And': [
+            {'Fn::Equals': [{'Ref': 'ApiExposure'}, 'internal']},
+            {'Fn::Equals': [{'Ref': 'ManageApiIngress'}, 'true']}]})
         self.assertEqual(private['Properties']['SourceSecurityGroupId'], {'Ref': 'ApiClientSecurityGroupId'})
         self.assertNotIn('CidrIp', private['Properties'])
+        self.assertEqual((private['Properties']['FromPort'], private['Properties']['ToPort']), (443, 443))
+        self.assertNotIn('SecurityGroupIngress', resources['ApiAlbSG']['Properties'])
+        api_ingress = {name for name, resource in resources.items() if resource['Type'] == 'AWS::EC2::SecurityGroupIngress'
+                       and resource['Properties']['GroupId'] == {'Ref': 'ApiAlbSG'}}
+        self.assertEqual(api_ingress, {'PublicHttps', 'PrivateApiHttps'})
         rule = template['Rules']['PrivateApiRequiresClients']
         self.assertEqual(rule['RuleCondition'], template['Conditions'][private['Condition']])
         self.assertEqual(rule['Assertions'][0]['Assert'], {'Fn::Not': [{'Fn::Equals': [{'Ref': 'ApiClientSecurityGroupId'}, '']}]})
         public_rule = template['Rules']['PublicApiRequiresSubnets']
         self.assertEqual(public_rule['RuleCondition'], template['Conditions'][public_condition])
         self.assertEqual(public_rule['Assertions'][0]['Assert'], {'Fn::Not': [{'Fn::Contains': [{'Ref': 'PublicSubnetIds'}, '']}]})
+        outputs = template['Outputs']
+        for name, resource in [('ApiSecurityGroupId', 'ApiAlbSG'), ('GatewaySecurityGroupId', 'GatewaySG'),
+                               ('DatabaseSecurityGroupId', 'DatabaseSG')]:
+            self.assertEqual(outputs[name]['Value'], {'Ref': resource})
+        self.assertEqual(outputs['DatabasePort']['Value'], {'Fn::GetAtt': ['Database', 'Endpoint.Port']})
+        self.assertEqual(outputs['ServiceConnectNamespaceArn'],
+                         {'Value': {'Fn::GetAtt': ['TlsNamespace', 'Arn']}, 'Condition': 'UseServiceConnectTls'})
+        self.assertFalse(any('Export' in output for output in outputs.values()))
 
     def test_internal_encryption_has_two_protected_modes_and_gates_all_services(self):
         template, errors = decode_str(subprocess.check_output([str(ROOT/'src/deploy.sh'), '--template'], text=True, timeout=10))

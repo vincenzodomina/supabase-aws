@@ -329,22 +329,35 @@ def run(directory, package):
     sensitive_values = [password, *keys.values()]
     print('PASS: packaged Lambda, rollback/recovery, baseline validation, immutable migration history, private ledger and TLS rejection.', flush=True)
 
+    def resolve_value(value):
+        if not isinstance(value, dict):
+            return value
+        if 'Ref' in value:
+            return values[value['Ref']]
+        if 'Fn::If' in value:
+            condition, yes, no = value['Fn::If']
+            return resolve_value(yes if resolve_value(template['Conditions'][condition]) else no)
+        if 'Fn::Not' in value:
+            return not resolve_value(value['Fn::Not'][0])
+        if 'Fn::Equals' in value:
+            left, right = value['Fn::Equals']
+            return resolve_value(left) == resolve_value(right)
+        if value == {'Fn::GetAtt': ['Database', 'Endpoint.Address']}:
+            return 'db'
+        return re.sub(r'\$\{([^}]+)\}', lambda m: str(values[m[1]]), value['Fn::Sub'])
+
+    storage = next(c for c in template['Resources']['StorageTask']['Properties']['ContainerDefinitions'] if c['Name'] == 'storage')
+    tenant = next(item['Value'] for item in storage['Environment'] if item['Name'] == 'TENANT_ID')
+    assert resolve_value(tenant) == values['AWS::StackName'], 'Empty tenant ID must preserve the stack-name prefix'
+    values['StorageTenantId'] = 'existing-tenant'
+    assert resolve_value(tenant) == 'existing-tenant'
+
     def start_service(name, overrides=None, network=None, extra_ports=(), hosts=()):
         task_name = 'AdminTask' if name in ('meta', 'studio') else name.title()+'Task'
         task = template['Resources'][task_name]['Properties']
         assert task['RuntimePlatform']['CpuArchitecture'] == {'Ref': 'EcsCpuArchitecture'}
         definition = next(c for c in task['ContainerDefinitions'] if c['Name'] == name)
-        environment = {}
-        for item in definition.get('Environment', []):
-            value = item['Value']
-            if isinstance(value, dict):
-                if 'Ref' in value:
-                    value = values[value['Ref']]
-                elif value == {'Fn::GetAtt': ['Database', 'Endpoint.Address']}:
-                    value = 'db'
-                else:
-                    value = re.sub(r'\$\{([^}]+)\}', lambda m: str(values[m[1]]), value['Fn::Sub'])
-            environment[item['Name']] = str(value)
+        environment = {item['Name']: str(resolve_value(item['Value'])) for item in definition.get('Environment', [])}
         for item in definition.get('Secrets', []):
             source = re.fullmatch(r'\$\{([^}]+)\}:([^:]+)::', item['ValueFrom']['Fn::Sub'])
             environment[item['Name']] = fixture_secrets[source[1]][source[2]]
@@ -464,6 +477,7 @@ def run(directory, package):
         objects = s3.list_objects_v2(Bucket='integration').get('Contents', [])
         stored = [item for item in objects if bucket in item['Key']]
         assert len(stored) == 1, 'Storage did not persist the object in S3'
+        assert stored[0]['Key'].startswith('existing-tenant/'+bucket+'/'), 'Storage ignored the configured tenant prefix'
         assert s3.get_object(Bucket='integration', Key=stored[0]['Key'])['Body'].read() == payload
         def service_state():
             with psycopg.connect(**database) as connection:
