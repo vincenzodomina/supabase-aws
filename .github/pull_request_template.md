@@ -4,7 +4,6 @@ Write this request yourself in your own words, following CONTRIBUTION.md. Replac
 
 - Prior issue: #...
 - PRD: link the relevant stories in docs/PRD/Supabase-AWS.md and their US-xx IDs.
-- ToDo: AWS-xx IDs, or state that no item applies.
 
 **Intent and resulting behavior**
 
@@ -22,7 +21,5 @@ Report the relevant checks and results, versions where relevant, and anything no
 
 - [ ] I wrote this body myself and understand the submitted implementation.
 - [ ] The PR links a prior issue, aligns with the cited PRD stories, and updates the PRD if requirements change.
-- [ ] This PR removes resolved ToDo items or edits partially addressed items to describe remaining work; otherwise, no listed item applies.
+- [ ] Any remaining acceptance criteria are tracked in a linked open issue; closing references only target fully resolved issues.
 - [ ] The implementation meets the stated acceptance criteria, with validation limits and affected documentation recorded.
-
-A PR that addresses a ToDo item without updating docs/ToDo.md in this PR is invalid and must not be merged.
