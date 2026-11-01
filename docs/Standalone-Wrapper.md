@@ -76,9 +76,11 @@ Complete the separately approved [manual AWS acceptance](Deployment.md#manual-aw
 
 Delete Supabase **before** its foundation: ECS needs the CA, networking, SMTP secret, and artifacts until its services have drained. Record both stacks' outputs first so retained resources remain discoverable.
 
-For the default names, explicitly remove database deletion protection, then delete the stacks in order:
+Use the same AWS identity/profile as deployment. For the default names, this block removes database deletion protection and deletes the stacks in order, stopping if any command fails:
 
 ```sh
+(
+set -e
 region=us-east-1
 name=supabase-demo
 aws cloudformation describe-stacks --stack-name "$name-foundation" --region "$region"
@@ -91,6 +93,7 @@ aws cloudformation delete-stack --stack-name "$name-supabase" --region "$region"
 aws cloudformation wait stack-delete-complete --stack-name "$name-supabase" --region "$region"
 aws cloudformation delete-stack --stack-name "$name-foundation" --region "$region"
 aws cloudformation wait stack-delete-complete --stack-name "$name-foundation" --region "$region"
+)
 ```
 
 If deletion fails, inspect the stack events before continuing; do not delete the foundation while services still depend on it. For partially created stacks, delete only the stacks/resources that exist and inspect any retained resources from rollback.
