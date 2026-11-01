@@ -372,7 +372,8 @@ def run(directory, package):
 
     certificate = template['Resources']['AuthTask']['Properties']['ContainerDefinitions'][0]
     readiness = next(c for c in template['Resources']['RestTask']['Properties']['ContainerDefinitions'] if c['Name'] == 'readiness')
-    s3.put_object(Bucket='artifacts', Key='rds-ca.pem', Body=(directory/'rds-ca.pem').read_bytes())
+    s3.put_object(Bucket='artifacts', Key='rds-ca.pem',
+                  Body=(directory/'rds-ca.pem').read_bytes() + (ROOT/'src/rds-ca.pem').read_bytes())
     command = ['s3://artifacts/rds-ca.pem' if isinstance(v, dict) else v for v in certificate['Command']]
     start('certificates', certificate['Image'], dict(aws_env, AWS_ENDPOINT_URL='http://moto:5000'),
           mounts=[prefix+':/shared'], command=command, platform=ecs_platform)
