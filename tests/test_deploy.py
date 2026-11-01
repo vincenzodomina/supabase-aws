@@ -35,7 +35,7 @@ if command == ['cloudformation', 'describe-stacks']:
         sys.exit('AccessDenied: cannot describe stack')
     if scenario in ['new', 'deploy-fails'] and not (root/'created').exists():
         sys.exit('ValidationError: Stack with id demo does not exist')
-    status = 'REVIEW_IN_PROGRESS' if scenario == 'review' else 'CREATE_COMPLETE'
+    status = scenario.removeprefix('status:') if scenario.startswith('status:') else 'REVIEW_IN_PROGRESS' if scenario == 'review' else 'CREATE_COMPLETE'
     print(json.dumps({'Stacks': [{'StackStatus': status}]}))
 elif command == ['cloudformation', 'deploy']:
     if scenario == 'deploy-fails': sys.exit('CloudFormation deployment failed')
@@ -46,8 +46,9 @@ elif command == ['cloudformation', 'deploy']:
     (root/'created').touch()
 elif command == ['cloudformation', 'get-stack-policy']:
     if scenario == 'policy-read-denied': sys.exit('AccessDenied: cannot read policy')
-    if scenario in ['new', 'review']:
-        print('{}'); sys.exit(0)
+    if scenario == 'no-policy': sys.exit(0)
+    if scenario in ['new', 'review', 'null-policy']:
+        print('null' if scenario == 'null-policy' else '{}'); sys.exit(0)
     statements = [
         {'Effect': 'Allow', 'Action': 'Update:*', 'Principal': '*', 'Resource': '*'},
         {'Effect': 'Deny', 'Action': 'Update:Delete', 'Principal': '*', 'Resource': 'LogicalResourceId/Bucket'},
@@ -143,6 +144,25 @@ class DeploymentTest(unittest.TestCase):
                 self.assertLess(calls.index(policy_call), calls.index(deployment))
                 if scenario == 'empty':
                     self.assertIn('No changes to deploy', result.stdout)
+
+    def test_invalid_inputs_and_stack_states_stop_before_uploads(self):
+        result, calls = self.run_deploy('new', parameters={'SiteURL': 'https://example.com'})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Unknown template parameter', result.stderr)
+        self.assertFalse(calls)
+        for status in ['UPDATE_IN_PROGRESS', 'DELETE_FAILED', 'ROLLBACK_COMPLETE']:
+            result, calls = self.run_deploy('status:'+status)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(status, result.stderr)
+            self.assertEqual([c[:3] for c in calls], [['aws', 'cloudformation', 'describe-stacks']])
+
+    def test_missing_policy_still_installs_data_protection(self):
+        for scenario in ['no-policy', 'null-policy']:
+            result, calls = self.run_deploy(scenario)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            policy = next(i for i, c in enumerate(calls) if c[:3] == ['aws', 'cloudformation', 'set-stack-policy'])
+            deploy = next(i for i, c in enumerate(calls) if c[:3] == ['aws', 'cloudformation', 'deploy'])
+            self.assertLess(policy, deploy)
 
     def test_access_error_is_not_treated_as_a_new_stack(self):
         result, calls = self.run_deploy('denied')

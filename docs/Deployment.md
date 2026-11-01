@@ -18,9 +18,21 @@ Copy `src/` into any directory in the consuming repository, preserving its inter
 
 The consuming pipeline can call the copied deployer directly, or use `--template` and `--package`, upload the rendered template, ZIP and CA bundle to its artifact bucket, and supply `ArtifactsBucket`, `BootstrapKey`, and `CertificateKey` to CloudFormation. A pipeline deploying without the script also owns installation of the [stack policy](#execution-and-packaging). Copying source does not import existing AWS resources or migrate data; preserve resource identities and plan database adoption separately.
 
+### Adopting an existing installation
+
+Copying this source does not adopt existing CloudFormation resources. Before a compute migration:
+
+- Preserve database and bucket logical identities, replacement-sensitive properties, subnet groups, and any imported exports. Keep the source stack's resource definitions where necessary; changing file location does not change resource ownership.
+- Preserve the Storage bucket, tenant prefix, and database metadata together. Confirm Auth settings, exposed schemas, upload limits, and existing credentials instead of assuming fresh-install defaults match.
+- Rehearse database upgrades and compatibility changes on a restored copy. Preserve Auth/Storage migration histories and application data; the bootstrap validates supported baselines, not arbitrary legacy databases.
+- Transfer or detach consumers of changing outputs before updating them. Use the surrounding pipeline for application migrations and private database access.
+- Verify backups and a recovery procedure before stopping writers. Retention and stack policies do not protect against direct service deletions; reverting containers does not reverse database migrations.
+
 ## Execution and packaging
 
 Examples use repository-root paths and the tools listed in the [README](../README.md#requirements). The deployer resolves source files beside itself; parameter and package-output paths are relative to the caller's working directory. Packaging downloads hash-verified Linux wheels; Docker is only required for local integration tests.
+
+The deployer rejects unknown parameters and stack states that cannot be updated before uploading artifacts. It preserves normal fresh-stack and unchanged-update behavior.
 
 The deploy command packages and uploads the template, Lambda ZIP, and CA bundle, then creates and executes a CloudFormation change set. Repeated deployments use current inputs; an unchanged stack succeeds. There is no built-in preview or saved-change-set execution mode. Use the consuming pipeline's native approval flow if required.
 
