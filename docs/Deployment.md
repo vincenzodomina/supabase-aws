@@ -1,6 +1,6 @@
 # Deployment and integration
 
-The [README quick start](../README.md#deploy) deploys the stack in one command. This guide covers permissions, embedding the source in other infrastructure, optional administration, and manual AWS acceptance.
+The [README quick start](../README.md#quickstart) deploys the stack in one command. This guide covers permissions, embedding the source in other infrastructure, optional administration, and manual AWS acceptance.
 
 ## Shared resources and permissions
 

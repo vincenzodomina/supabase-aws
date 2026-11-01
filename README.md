@@ -31,7 +31,38 @@ flowchart TD
     Auth --> SES[Existing Amazon SES]
 ```
 
+## Quickstart
+
+**Embed in existing infrastructure:** copy the source from a reviewed version into the consuming repository, preserving attribution:
+
+```sh
+mkdir -p infra/supabase
+cp -R /path/to/supabase-aws/src/. infra/supabase/
+cp /path/to/supabase-aws/{LICENSE,NOTICE} infra/supabase/
+```
+
+Populate `infra/supabase/parameters.json` from the example, then call the deployer after the shared foundation in the existing deployment script or pipeline:
+
+```sh
+./infra/supabase/deploy.sh --stack-name "$supabase_stack" --region "$region" \
+  --parameters infra/supabase/parameters.json --artifacts-bucket "$artifacts_bucket"
+```
+
+See [integration details](docs/Deployment.md#embedding-source) for the shared inputs and outputs.
+
+**Try a standalone demo:** the [wrapper](docs/Standalone-Wrapper.md) creates the foundation and deploys the same Supabase stack. From a checkout, supply an unused subdomain and its already delegated public Route 53 zone:
+
+```sh
+./wrapper/deploy.sh --domain supabase.example.com --hosted-zone-id Z0123456789EXAMPLE
+```
+
+[![Deploy with AWS CloudShell](https://img.shields.io/badge/Deploy-AWS_CloudShell-FF9900)](https://console.aws.amazon.com/cloudshell/home?region=us-east-1)
+
+The button opens CloudShell; obtain the source and run the command there. This creates **paid resources and a public HTTPS API** in `us-east-1`; it does not provision a production foundation. See [setup, costs, and cleanup](docs/Standalone-Wrapper.md).
+
 ## Requirements
+
+For direct deployment. The wrapper has its own [account and domain prerequisites](docs/Standalone-Wrapper.md#before-starting).
 
 - An AWS account with stack deployment permissions and an existing VPC, private subnets across two Availability Zones, and shared outbound connectivity.
 - VPC encryption enforcement (default), or Service Connect TLS with an existing AWS Private CA. See [networking prerequisites](docs/Networking.md).

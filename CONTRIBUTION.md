@@ -18,9 +18,9 @@ Development checks additionally require ShellCheck and Docker for the disposable
 ```sh
 python3.13 -m venv .venv
 .venv/bin/pip install --require-hashes -r tests/requirements.txt
-shellcheck src/deploy.sh src/gateway-entrypoint.sh
+shellcheck src/deploy.sh src/gateway-entrypoint.sh wrapper/deploy.sh
 ./src/deploy.sh --template > /tmp/supabase.yaml
-.venv/bin/cfn-lint /tmp/supabase.yaml
+.venv/bin/cfn-lint /tmp/supabase.yaml wrapper/foundation.yaml
 .venv/bin/python -m unittest discover -s tests -p 'test_*.py'
 ./src/deploy.sh --package /tmp/bootstrap.zip
 .venv/bin/python tests/integration.py /tmp/bootstrap.zip
