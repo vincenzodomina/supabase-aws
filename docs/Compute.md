@@ -42,7 +42,7 @@ Application Auto Scaling owns core service replica counts, so routine deployment
 
 ## Query statistics
 
-Set `DatabaseQueryStatistics=top` to collect top-level query execution statistics; the default `none` disables collection. The stack installs `pg_stat_statements` in the private `supabase_aws` schema, with no view or function access for API/service roles. Connect as the database administrator through an approved private client; no exporter or additional AWS resource is deployed.
+Set `DatabaseQueryStatistics=top` to collect top-level query execution statistics; the default `none` disables collection. This is an instance-wide setting: on upgrade, choose `top` if existing monitoring relies on these statistics. The stack installs `pg_stat_statements` in the private `supabase_aws` schema, with no view or function access for API/service roles. Connect as the database administrator through an approved private client; no exporter or additional AWS resource is deployed.
 
 [RDS PostgreSQL preloads the module by default](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Appendix.PostgreSQL.CommonDBATasks.html). The stack preserves that AWS default. Verify effective settings after deployment; if the library is absent, an approved parameter-group change and restart are required before diagnostics work.
 
