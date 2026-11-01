@@ -28,6 +28,12 @@ The deployer installs a CloudFormation stack policy blocking database replacemen
 
 Envoy uses its pinned official image. `src/deploy.sh` embeds `src/gateway-entrypoint.sh` into the template before upload; the `@include` marker is local packaging syntax, not a CloudFormation feature. Use `./src/deploy.sh --template > rendered.yaml` to produce the deployable template for review or another pipeline (with its S3 artifact parameters), without AWS credentials. Gateway configuration lives in `src/supabase.yaml`, and secrets are injected by ECS at task launch.
 
+## Embedding configuration
+
+Stack outputs include `ApiSecurityGroupId`, `GatewaySecurityGroupId`, `DatabaseSecurityGroupId`, and `DatabasePort`. `ServiceConnectNamespaceArn` is available only in Service Connect TLS mode. Outputs create no CloudFormation exports or additional access rules; the consuming infrastructure chooses how to pass them to clients. For application stacks deployed later, see [consumer-managed API ingress](Networking.md#api-access-and-dns). Joining the Service Connect namespace also requires compatible client service configuration and explicit network access; ordinary VPC clients should use the HTTPS API URL.
+
+`StorageTenantId` defaults to the stack name when empty. Supply the original tenant ID when preserving an existing Storage object layout: S3 object keys include this prefix. Keep the bucket, tenant ID, and database Storage metadata together. Changing the parameter does not migrate objects and can make existing files unreachable.
+
 ## Optional administration
 
 Set `EnableStudio=true`, provide `StudioDomainName`, and narrow `StudioClientCidr` to your private/VPN clients. Create the Studio DNS record pointing at `StudioLoadBalancerDnsName`; it must resolve for those clients. The certificate must cover this hostname.

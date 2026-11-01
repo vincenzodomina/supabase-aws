@@ -52,9 +52,14 @@ Parameters:
     Default: internal
   ApiClientSecurityGroupId:
     Type: String
-    Description: Existing application/client security group in the VPC allowed HTTPS access to the internal API.
+    Description: Existing client security group allowed HTTPS access to the internal API when ManageApiIngress=true.
     Default: ''
     AllowedPattern: '(^$|sg-([0-9a-f]{8}|[0-9a-f]{17}))'
+  ManageApiIngress:
+    Type: String
+    Description: For internal APIs, create the client HTTPS rule. Set false only when consuming infrastructure owns ingress to ApiSecurityGroupId.
+    AllowedValues: ['true', 'false']
+    Default: 'true'
   HostedZoneId:
     Type: String
     Description: Existing Route 53 zone; use a VPC-associated private zone for internal access. Empty means manage DNS yourself.
@@ -192,6 +197,11 @@ Parameters:
     Description: Permanently expire noncurrent S3 versions after this many days. Zero disables expiry. Review recovery/erasure policy in docs/Retention.md first.
     Default: 0
     MinValue: 0
+  StorageTenantId:
+    Type: String
+    Description: Stable Storage object-key prefix. Empty uses the stack name. Preserve the existing value when adopting stored objects; changing it does not move files.
+    Default: ''
+    AllowedPattern: '(^$|[a-zA-Z0-9][a-zA-Z0-9._-]{0,127})'
   DisableSignup:
     Type: String
     Description: Require invitations/admin-created users.
@@ -334,12 +344,15 @@ Conditions:
     - !Equals [!Ref 'InternalTrafficEncryption', service-connect-tls]
     - !Not [!Equals [!Ref 'ServiceConnectKmsKeyArn', '']]
   ExpireStorageHistory: !Not [!Equals [!Ref 'StorageNoncurrentVersionRetentionDays', 0]]
+  HasStorageTenantId: !Not [!Equals [!Ref 'StorageTenantId', '']]
   ManageServiceLogRetention: !Not [!Equals [!Ref 'ServiceLogRetentionDays', 0]]
   CollectContainerInsights: !Equals [!Ref 'ContainerInsights', enabled]
   MonitorDatabaseConnections: !Not [!Equals [!Ref 'DatabaseConnectionAlarmThreshold', 0]]
   MonitorDatabaseMemory: !Not [!Equals [!Ref 'DatabaseFreeableMemoryAlarmBytes', 0]]
   PublicApi: !Equals [!Ref 'ApiExposure', internet-facing]
-  PrivateApi: !Equals [!Ref 'ApiExposure', internal]
+  ManagePrivateApiIngress: !And
+    - !Equals [!Ref 'ApiExposure', internal]
+    - !Equals [!Ref 'ManageApiIngress', 'true']
   HasSesSmtpKmsKey: !Not
     - !Equals
       - !Ref 'SesSmtpKmsKeyArn'
@@ -488,7 +501,7 @@ Resources:
       CidrIp: 0.0.0.0/0
   PrivateApiHttps:
     Type: AWS::EC2::SecurityGroupIngress
-    Condition: PrivateApi
+    Condition: ManagePrivateApiIngress
     # Rules reject the empty optional ID before this resource is created.
     Metadata:
       cfn-lint:
@@ -2704,7 +2717,7 @@ Resources:
             - Name: AWS_REGION
               Value: !Ref 'AWS::Region'
             - Name: TENANT_ID
-              Value: !Ref 'AWS::StackName'
+              Value: !If [HasStorageTenantId, !Ref 'StorageTenantId', !Ref 'AWS::StackName']
             - Name: FILE_SIZE_LIMIT
               Value: !Ref 'FileSizeLimitBytes'
             - Name: ENABLE_IMAGE_TRANSFORMATION
@@ -3268,8 +3281,16 @@ Outputs:
     Value: !Sub 'https://${ApiDomainName}'
   ApiLoadBalancerDnsName:
     Value: !GetAtt 'ApiAlb.DNSName'
+  ApiSecurityGroupId:
+    Value: !Ref 'ApiAlbSG'
+  GatewaySecurityGroupId:
+    Value: !Ref 'GatewaySG'
   DatabaseEndpoint:
     Value: !GetAtt 'Database.Endpoint.Address'
+  DatabasePort:
+    Value: !GetAtt 'Database.Endpoint.Port'
+  DatabaseSecurityGroupId:
+    Value: !Ref 'DatabaseSG'
   DatabaseSecretArn:
     Value: !Ref 'DatabaseSecret'
   ApiSecretArn:
@@ -3278,6 +3299,9 @@ Outputs:
     Value: !Ref 'Bucket'
   ClusterName:
     Value: !Ref 'Cluster'
+  ServiceConnectNamespaceArn:
+    Value: !GetAtt 'TlsNamespace.Arn'
+    Condition: UseServiceConnectTls
   LogGroupName:
     Value: !Ref 'LogGroup'
   StudioUrl:
@@ -3293,10 +3317,12 @@ Rules:
       - Assert: !Not [!Equals [!Ref 'ServiceConnectPrivateCaArn', '']]
         AssertDescription: Provide an existing tagged AWS Private CA for Service Connect TLS.
   PrivateApiRequiresClients:
-    RuleCondition: !Equals [!Ref 'ApiExposure', internal]
+    RuleCondition: !And
+      - !Equals [!Ref 'ApiExposure', internal]
+      - !Equals [!Ref 'ManageApiIngress', 'true']
     Assertions:
       - Assert: !Not [!Equals [!Ref 'ApiClientSecurityGroupId', '']]
-        AssertDescription: Provide ApiClientSecurityGroupId for internal API access.
+        AssertDescription: Provide ApiClientSecurityGroupId or explicitly set ManageApiIngress=false and manage private ingress in the consuming infrastructure.
   PublicApiRequiresSubnets:
     RuleCondition: !Equals [!Ref 'ApiExposure', internet-facing]
     Assertions:
