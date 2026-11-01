@@ -123,6 +123,11 @@ Parameters:
     Type: String
     Description: RDS instance size; tune together with service connection limits.
     Default: db.t4g.medium
+  DatabaseQueryStatistics:
+    Type: String
+    Description: Optional administrator-only query statistics; top collects top-level statements, none stops collection. See docs/Compute.md.
+    AllowedValues: [none, top]
+    Default: none
   DatabaseMultiAZ:
     Type: String
     Description: Enable RDS standby in another Availability Zone.
@@ -784,6 +789,8 @@ Resources:
       Parameters:
         rds.force_ssl: '1'
         password_encryption: scram-sha-256
+        pg_stat_statements.track: !Ref 'DatabaseQueryStatistics'
+        pg_stat_statements.track_utility: '0'
   Database:
     Type: AWS::RDS::DBInstance
     Properties:
