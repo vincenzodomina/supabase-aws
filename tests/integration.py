@@ -542,9 +542,9 @@ server.serve_forever()
         assert any(notification.payload == 'reload schema' for notification in listener.notifies(timeout=5, stop_after=1)), 'ALTER TYPE did not notify PostgREST'
         writer.execute('DROP TYPE public.integration_type')
     publishable = {'apikey': keys['SUPABASE_PUBLISHABLE_KEY']}
-    if keys['JWT_SECRET'] == legacy['JWT_SECRET']:
-        for name in ['ANON_KEY', 'SERVICE_ROLE_KEY']:
-            assert request(url+'/rest/v1/', headers={'apikey': legacy[name]})[0] == 200
+    for name, expected in [('ANON_KEY', []), ('SERVICE_ROLE_KEY', [{'value': 'private'}])]:
+        status, body = request(url+'/rest/v1/integration_secret?select=value', headers={'apikey': legacy[name]})
+        assert status == 200 and json.loads(body) == expected, f'Imported {name} did not retain its access role: HTTP {status}'
     for path in ['/', '/pg/', '/realtime/v1/', '/functions/v1/', '/graphql/v1', '/mcp']:
         assert request(url+path, headers={'apikey': keys['SUPABASE_SECRET_KEY']})[0] in (401, 403, 404), path
     for key in [None, 'invalid-key']:
@@ -563,6 +563,13 @@ server.serve_forever()
         with psycopg.connect(**database) as connection:
             connection.execute('INSERT INTO public.integration_secret VALUES (%s, %s)', (user['user']['id'], email))
     user = users[0]
+    legacy_access_token = sign_token({'alg': 'HS256', 'typ': 'JWT'},
+        {'sub': user['user']['id'], 'role': 'authenticated', 'aud': 'authenticated', 'exp': int(time.time()) + 3600},
+        lambda value: hmac.digest(legacy['JWT_SECRET'].encode(), value, 'sha256'))
+    legacy_headers = dict(publishable, Authorization='Bearer '+legacy_access_token)
+    status, body = request(url+'/rest/v1/integration_secret?select=value', headers=legacy_headers)
+    assert status == 200 and json.loads(body) == [{'value': user['user']['email']}], 'Imported signing secret did not preserve HS256 user access'
+    assert request(url+'/auth/v1/user', headers=legacy_headers)[0] == 200
     header = user['access_token'].split('.')[0]
     assert json.loads(base64.urlsafe_b64decode(header+'='*(-len(header)%4)))['alg'] == 'ES256'
     status, body = request(url+'/auth/v1/.well-known/jwks.json')
@@ -695,7 +702,7 @@ server.serve_forever()
     fixture_secrets['ApiSecret'] = dict(keys)
     url = restart_applications()
     publishable = {'apikey': keys['SUPABASE_PUBLISHABLE_KEY']}
-    for token in [user['access_token'], old_keys['ANON_KEY']]:
+    for token in [user['access_token'], old_keys['ANON_KEY'], legacy_access_token]:
         assert request(url+'/rest/v1/integration_secret', headers=dict(publishable, Authorization='Bearer '+token))[0] == 401
     status, body = request(url+'/auth/v1/token?grant_type=refresh_token', 'POST',
                            {'refresh_token': user['refresh_token']}, publishable)
