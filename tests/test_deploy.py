@@ -280,6 +280,20 @@ class ArtifactTest(unittest.TestCase):
                 self.assertEqual(resources[name]['Properties'][field], {'Fn::If': ['UseServiceConnectTls', 'HTTPS', 'HTTP']})
             self.assertEqual(resources[name]['Properties']['HealthCheckPort'], 'traffic-port')
 
+    def test_credential_refresh_reapplies_bootstrap_before_replacing_tasks(self):
+        template, errors = decode_str(subprocess.check_output([str(ROOT/'src/deploy.sh'), '--template'], text=True, timeout=10))
+        self.assertFalse(errors)
+        resources = template['Resources']
+        revision = resources['Bootstrap']['Properties']['CredentialRevision']
+        self.assertEqual(template['Parameters'][revision['Ref']]['Default'], 'initial')
+        for name, resource in resources.items():
+            if resource['Type'] == 'AWS::ECS::Service':
+                with self.subTest(service=name):
+                    self.assertIn('Bootstrap', resource['DependsOn'])
+                    self.assertEqual(resource['Properties']['ForceNewDeployment'], {
+                        'EnableForceNewDeployment': True, 'ForceNewDeploymentNonce': revision})
+        self.assertNotIn(revision['Ref'], json.dumps(resources['Database']))
+
     def test_rendered_template_and_all_tasks_fit_size_budgets(self):
         rendered = subprocess.check_output([str(ROOT/'src/deploy.sh'), '--template'], timeout=10)
         self.assertLess(len(rendered), 1024*1024)

@@ -28,6 +28,9 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from acceptance import check_storage
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT/'src'))
+from bootstrap import generate_keys
+
 template, errors = decode_str(subprocess.check_output([str(ROOT/'src/deploy.sh'), '--template'], text=True, timeout=10))
 assert not errors, errors
 DATABASE_IMAGE = 'postgres:17-bookworm@sha256:839fbb5a4942a7758dd93e18b42ea5649807491a0545b5eeeb8f0b8bb11857a5'
@@ -124,6 +127,8 @@ def run(directory, package):
                        'MetaSecret': {'crypto_key': secrets.token_hex(24)},
                        'AuthSecret': {'password': password}, 'RestSecret': {'password': password},
                        'StorageSecret': {'password': password}, 'SesSmtpSecretArn': {'username': '', 'password': ''}}
+    for name in ['AuthSecret', 'RestSecret', 'StorageSecret']:
+        fixture_secrets[name].update(json.loads(template['Resources'][name]['Properties']['GenerateSecretString']['SecretStringTemplate']))
     properties = {name: sm.create_secret(Name=name, SecretString=json.dumps(value))['ARN']
                   for name, value in fixture_secrets.items()}
     properties.update(DatabaseHost='db', DatabasePort=5432)
@@ -276,6 +281,7 @@ def run(directory, package):
     for name in fixture_secrets:
         fixture_secrets[name] = json.loads(sm.get_secret_value(SecretId=properties[name])['SecretString'])
     keys = dict(fixture_secrets['ApiSecret'])
+    sensitive_values = [password, *keys.values()]
     print('PASS: packaged Lambda, rollback/recovery, baseline validation, immutable migration history, private ledger and TLS rejection.', flush=True)
 
     def start_service(name, overrides=None, network=None, extra_ports=(), hosts=()):
@@ -314,10 +320,27 @@ def run(directory, package):
           mounts=[prefix+':/shared'], command=command, platform=ecs_platform)
     assert docker('wait', prefix+'-certificates') == '0', 'Certificate download failed'
     certmount = prefix+':/certs:ro'
-    authport = start_service('auth', {'GOTRUE_DISABLE_SIGNUP': 'false', 'GOTRUE_MAILER_AUTOCONFIRM': 'true'})
-    wait_http(f'http://127.0.0.1:{authport}/health')
-    restport = start_service('rest')
-    wait_http(f'http://127.0.0.1:{restport}/')
+
+    def start_applications():
+        authport = start_service('auth', {'GOTRUE_DISABLE_SIGNUP': 'false', 'GOTRUE_MAILER_AUTOCONFIRM': 'true'})
+        wait_http(f'http://127.0.0.1:{authport}/health')
+        restport = start_service('rest')
+        wait_http(f'http://127.0.0.1:{restport}/')
+        start('readiness', readiness['Image'], {}, network='container:'+prefix+'-rest',
+              entrypoint=readiness['EntryPoint'][0], command=readiness['EntryPoint'][1:]+readiness['Command'], platform=ecs_platform)
+        docker('exec', prefix+'-readiness', *readiness['HealthCheck']['Command'][1:])
+        storageport = start_service('storage', dict(aws_env, STORAGE_S3_ENDPOINT='http://moto:5000', STORAGE_S3_FORCE_PATH_STYLE='true'))
+        wait_http(f'http://127.0.0.1:{storageport}/status')
+        hosts = []
+        for service in ['auth', 'rest', 'storage']:
+            address = docker('inspect', '--format', '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}', prefix+'-'+service)
+            hosts.append(f'{service}.service-connect.invalid:{address}')
+        gwport = start_service('gateway', {'SERVICE_NAMESPACE': 'service-connect.invalid'}, hosts=hosts)
+        url = f'http://127.0.0.1:{gwport}'
+        wait_http(url+'/healthz')
+        return restport, url
+
+    restport, url = start_applications()
     with psycopg.connect(**database) as connection:
         connection.execute('''CREATE TABLE public.integration_secret (owner uuid, value text);
             ALTER TABLE public.integration_secret ENABLE ROW LEVEL SECURITY;
@@ -351,18 +374,6 @@ def run(directory, package):
         writer.execute('ALTER TYPE public.integration_type ADD ATTRIBUTE added_live text')
         assert any(notification.payload == 'reload schema' for notification in listener.notifies(timeout=5, stop_after=1)), 'ALTER TYPE did not notify PostgREST'
         writer.execute('DROP TYPE public.integration_type')
-    start('readiness', readiness['Image'], {}, network='container:'+prefix+'-rest',
-          entrypoint=readiness['EntryPoint'][0], command=readiness['EntryPoint'][1:]+readiness['Command'], platform=ecs_platform)
-    docker('exec', prefix+'-readiness', *readiness['HealthCheck']['Command'][1:])
-    storageport = start_service('storage', dict(aws_env, STORAGE_S3_ENDPOINT='http://moto:5000', STORAGE_S3_FORCE_PATH_STYLE='true'))
-    wait_http(f'http://127.0.0.1:{storageport}/status')
-    hosts = []
-    for service in ['auth', 'rest', 'storage']:
-        address = docker('inspect', '--format', '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}', prefix+'-'+service)
-        hosts.append(f'{service}.service-connect.invalid:{address}')
-    gwport = start_service('gateway', {'SERVICE_NAMESPACE': 'service-connect.invalid'}, hosts=hosts)
-    url = f'http://127.0.0.1:{gwport}'
-    wait_http(url+'/healthz')
     publishable = {'apikey': keys['SUPABASE_PUBLISHABLE_KEY']}
     for path in ['/', '/pg/', '/realtime/v1/', '/functions/v1/', '/graphql/v1', '/mcp']:
         assert request(url+path, headers={'apikey': keys['SUPABASE_SECRET_KEY']})[0] in (401, 403, 404), path
@@ -450,6 +461,82 @@ def run(directory, package):
     purged = s3.list_object_versions(Bucket='integration')
     assert not purged.get('Versions') and not purged.get('DeleteMarkers'), 'Administrator purge left version history'
     print('PASS: API deletion retains S3 history; explicit version purge removes the disposable fixture history.', flush=True)
+    def check_sensitive_logs():
+        for name in ['gateway', 'lambda', 'lambda-untrusted']:
+            logs = docker('logs', prefix+'-'+name, stderr=subprocess.STDOUT)
+            assert all(value not in logs for value in sensitive_values), 'Credentials appeared in container logs'
+
+    def restart_applications():
+        check_sensitive_logs()
+        for name in ['gateway', 'storage', 'readiness', 'rest', 'auth']:
+            container = prefix+'-'+name
+            docker('rm', '-f', container)
+            containers.remove(container)
+        return start_applications()[1]
+
+    before_rotation = migration_history()
+    old_passwords = {}
+    for name in ['AuthSecret', 'RestSecret', 'StorageSecret']:
+        value = dict(fixture_secrets[name])
+        old_passwords[value['username']] = value['password']
+        value['password'] = secrets.token_urlsafe(36)+':/@'
+        sensitive_values.extend([old_passwords[value['username']], value['password']])
+        sm.put_secret_value(SecretId=properties[name], SecretString=json.dumps(value))
+    old_keys = dict(keys)
+    replacement = generate_keys(keys['JWT_SECRET'])
+    for name in ['SUPABASE_PUBLISHABLE_KEY', 'SUPABASE_SECRET_KEY']:
+        keys[name] = replacement[name]
+    sensitive_values.extend(keys.values())
+    sm.put_secret_value(SecretId=properties['ApiSecret'], SecretString=json.dumps(keys))
+    properties['CredentialRevision'] = 'password-and-opaque-keys'
+    for _ in range(2):
+        assert invoke(lambdaport, 'Update', physical_id=identity) == identity
+    assert migration_history() == before_rotation
+    assert json.loads(sm.get_secret_value(SecretId=properties['ApiSecret'])['SecretString']) == keys
+    for name in ['AuthSecret', 'RestSecret', 'StorageSecret']:
+        value = json.loads(sm.get_secret_value(SecretId=properties[name])['SecretString'])
+        fixture_secrets[name] = value
+        with psycopg.connect(value['uri'], host=database['host'], port=database['port'],
+                             sslrootcert=database['sslrootcert']) as connection:
+            assert connection.execute('SELECT current_user').fetchone() == (value['username'],)
+        try:
+            psycopg.connect(**dict(database, user=value['username'], password=old_passwords[value['username']])).close()
+        except psycopg.OperationalError as error:
+            assert 'password authentication failed' in str(error)
+        else:
+            raise AssertionError('Old service password still authenticates')
+    fixture_secrets['ApiSecret'] = dict(keys)
+    url = restart_applications()
+    publishable = {'apikey': keys['SUPABASE_PUBLISHABLE_KEY']}
+    check_sessions()
+    assert request(url+'/rest/v1/integration_secret', headers={'apikey': old_keys['SUPABASE_PUBLISHABLE_KEY']})[0] in (401, 403)
+    assert request(url+'/rest/v1/integration_secret', headers={'apikey': old_keys['SUPABASE_SECRET_KEY']})[0] in (401, 403)
+    check_storage(url, keys)
+    print('PASS: service passwords and opaque API keys rotate; repaired URIs reconnect, retries preserve signing keys and sessions.', flush=True)
+
+    old_keys = dict(keys)
+    keys = generate_keys(secrets.token_urlsafe(36))
+    sensitive_values.extend(keys.values())
+    sm.put_secret_value(SecretId=properties['ApiSecret'], SecretString=json.dumps(keys))
+    properties['CredentialRevision'] = 'signing-bundle'
+    assert invoke(lambdaport, 'Update', physical_id=identity) == identity
+    assert json.loads(sm.get_secret_value(SecretId=properties['ApiSecret'])['SecretString']) == keys
+    fixture_secrets['ApiSecret'] = dict(keys)
+    url = restart_applications()
+    publishable = {'apikey': keys['SUPABASE_PUBLISHABLE_KEY']}
+    for token in [user['access_token'], old_keys['ANON_KEY']]:
+        assert request(url+'/rest/v1/integration_secret', headers=dict(publishable, Authorization='Bearer '+token))[0] == 401
+    status, body = request(url+'/auth/v1/token?grant_type=refresh_token', 'POST',
+                           {'refresh_token': user['refresh_token']}, publishable)
+    assert status == 200, 'Signing-key rotation must not be mistaken for session revocation'
+    user.update(json.loads(body))
+    headers = dict(publishable, Authorization='Bearer '+user['access_token'])
+    status, body = request(url+'/rest/v1/integration_secret?select=value', headers=headers)
+    assert status == 200 and json.loads(body) == [{'value': user['user']['email']}]
+    assert migration_history() == before_rotation
+    check_storage(url, keys)
+    print('PASS: complete signing-key cutover rejects old access tokens; retained refresh sessions obtain valid new tokens.', flush=True)
+
     metaport = start_service('meta', extra_ports=(3000,))
     wait_http(f'http://127.0.0.1:{metaport}/health')
     assert request(f'http://127.0.0.1:{metaport}/tables')[0] == 200, 'Meta could not read database metadata'
@@ -462,9 +549,7 @@ def run(directory, package):
     assert request(url+'/auth/v1/user', headers=dict(publishable, Authorization='Bearer '+user['access_token']))[0] == 200
     modes = docker('exec', prefix+'-gateway', 'stat', '-c', '%a', '/etc/envoy/lds.yaml')
     assert all(int(mode, 8) & 0o077 == 0 for mode in modes.splitlines()), 'Gateway configuration exposed secrets to other users'
-    for name in ['gateway', 'lambda', 'lambda-untrusted']:
-        logs = docker('logs', prefix+'-'+name, stderr=subprocess.STDOUT)
-        assert all(value not in logs for value in [password, *keys.values()]), 'Credentials appeared in container logs'
+    check_sensitive_logs()
     gateway = template['Resources']['GatewayTask']['Properties']['ContainerDefinitions'][0]
     start('gateway-missing-env', gateway['Image'], {}, entrypoint=gateway['EntryPoint'][0],
           command=gateway['EntryPoint'][1:]+gateway['Command'], platform=ecs_platform)

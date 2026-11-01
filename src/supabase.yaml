@@ -106,6 +106,11 @@ Parameters:
   BootstrapKey:
     Type: String
     Description: Content-addressed Lambda ZIP object key; supplied by deploy.sh.
+  CredentialRevision:
+    Type: String
+    Description: Non-secret change identifier; change deliberately to reapply credentials and roll all services. See docs/Credentials.md.
+    Default: initial
+    AllowedPattern: '[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}'
   CertificateKey:
     Type: String
     Description: Content-addressed RDS CA bundle object key; supplied by deploy.sh.
@@ -1188,6 +1193,7 @@ Resources:
   Bootstrap:
     Type: Custom::DatabaseBootstrap
     Properties:
+      CredentialRevision: !Ref 'CredentialRevision'
       ServiceToken: !GetAtt 'BootstrapHandler.Arn'
       ServiceTimeout: 960
       Revision: !Ref 'BootstrapKey'
@@ -2117,6 +2123,9 @@ Resources:
       Cluster: !Ref 'Cluster'
       TaskDefinition: !Ref 'GatewayTask'
       LaunchType: FARGATE
+      ForceNewDeployment:
+        EnableForceNewDeployment: true
+        ForceNewDeploymentNonce: !Ref 'CredentialRevision'
       PlatformVersion: 1.4.0
       NetworkConfiguration:
         AwsvpcConfiguration:
@@ -2353,6 +2362,9 @@ Resources:
       Cluster: !Ref 'Cluster'
       TaskDefinition: !Ref 'AuthTask'
       LaunchType: FARGATE
+      ForceNewDeployment:
+        EnableForceNewDeployment: true
+        ForceNewDeploymentNonce: !Ref 'CredentialRevision'
       PlatformVersion: 1.4.0
       NetworkConfiguration:
         AwsvpcConfiguration:
@@ -2552,6 +2564,9 @@ Resources:
       Cluster: !Ref 'Cluster'
       TaskDefinition: !Ref 'RestTask'
       LaunchType: FARGATE
+      ForceNewDeployment:
+        EnableForceNewDeployment: true
+        ForceNewDeploymentNonce: !Ref 'CredentialRevision'
       PlatformVersion: 1.4.0
       NetworkConfiguration:
         AwsvpcConfiguration:
@@ -2757,6 +2772,9 @@ Resources:
       Cluster: !Ref 'Cluster'
       TaskDefinition: !Ref 'StorageTask'
       LaunchType: FARGATE
+      ForceNewDeployment:
+        EnableForceNewDeployment: true
+        ForceNewDeploymentNonce: !Ref 'CredentialRevision'
       PlatformVersion: 1.4.0
       NetworkConfiguration:
         AwsvpcConfiguration:
@@ -3087,6 +3105,9 @@ Resources:
       TaskDefinition: !Ref 'AdminTask'
       DesiredCount: 1
       LaunchType: FARGATE
+      ForceNewDeployment:
+        EnableForceNewDeployment: true
+        ForceNewDeploymentNonce: !Ref 'CredentialRevision'
       PlatformVersion: 1.4.0
       NetworkConfiguration:
         AwsvpcConfiguration:
