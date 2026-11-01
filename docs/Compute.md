@@ -18,6 +18,28 @@ The selected architecture applies to application and helper containers. Database
 
 Local compatibility does not establish Fargate capacity or performance. Before choosing ARM in production, compare representative throughput, p95/p99 latency, errors, CPU, memory, and total task cost in the same region with equivalent resource allocations and replicas. Include rollout/surge headroom and optional administration. Use [current regional Fargate pricing](https://aws.amazon.com/fargate/pricing/); lower unit prices alone do not prove lower workload cost. Revert the parameter to x86-64 if acceptance fails; changing architecture does not reverse database migrations.
 
+## Service scaling and database connections
+
+Set CPU/memory using valid Fargate combinations. Size service maximums and deployment surge together with RDS connection capacity; horizontal service scaling does not scale RDS. Initial per-replica pools are limited to five connections for Auth, PostgREST, and Storage, but migrations and background work can create additional connections. Retain database headroom. One replica is an explicit availability compromise.
+
+The configured pool budget at maximum scale is `5 × (AuthMaxTasks + RestMaxTasks + StorageMaxTasks)`: 60 connections at the defaults, or 120 if all three services overlap at their 200% rolling-deployment limit. This is only the configured pool component, not a total connection cap. Add headroom for listeners, migrations, bootstrap, Studio/meta, external applications, and database-reserved connections.
+
+Before production, use an approved database client to inspect the actual instance settings and connection usage:
+
+```sql
+SELECT name, setting FROM pg_settings
+WHERE name IN ('max_connections', 'superuser_reserved_connections',
+               'reserved_connections', 'rds.rds_superuser_reserved_connections');
+SELECT usename, application_name, count(*) FROM pg_stat_activity
+WHERE backend_type = 'client backend' GROUP BY usename, application_name;
+```
+
+Keep the deployment budget plus measured headroom below usable capacity; verify replacement under representative load and repeat after changing the RDS class, pool settings, or service maxima. [RDS connection limits](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/CHAP_Limits.html) depend on database configuration and memory. CloudWatch `DatabaseConnections` does not count every internal database session.
+
+If enterprise monitoring does not already cover these signals, set positive `DatabaseConnectionAlarmThreshold` and `DatabaseFreeableMemoryAlarmBytes` values, with an existing `AlarmTopicArn` for notifications. Choose a connection warning below usable capacity and a free-memory floor from workload measurements. Each alarm requires two breaching one-minute periods out of three; without a topic, alarm state remains visible in CloudWatch. Zero omits that alarm and its cost. These alerts do not enforce a connection limit or automatically resize RDS.
+
+Application Auto Scaling owns core service replica counts, so routine deployments preserve scaled capacity. New services initially start with one task; scalable-target registration raises them to their configured minimum. Verify all minimums are reached before serving traffic. Changing minimum or maximum bounds can adjust current capacity.
+
 ## RDS workload sizing
 
 `DatabaseInstanceClass` defaults to `db.t4g.medium`; that is a starting configuration, not production capacity evidence. [AWS recommends T classes for development/test and other non-production workloads](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/rds-metrics.html). Evaluate a supported fixed-performance class for sustained enterprise workloads before production acceptance. Preserve Multi-AZ availability, encryption, recovery, and connection headroom when comparing cost.

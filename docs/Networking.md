@@ -1,4 +1,4 @@
-# Internal encryption
+# Networking
 
 `InternalTrafficEncryption` selects one of two protected deployment modes. API clients use the existing HTTPS Supabase URL in either mode. RDS clients continue to verify database TLS; S3 and AWS APIs use HTTPS, and SES SMTP uses STARTTLS.
 
@@ -53,3 +53,27 @@ TLS raises only baseline CPU/memory choices; larger operator values remain uncha
 Changing modes replaces ALB target groups and rolls services. Mixed HTTP/TLS generations can fail during the transition: use a planned maintenance window, quiesce application traffic, and verify every backend before reopening access. Review the source and parameters for resource replacements; preserve database and object resources. Existing tasks need replacement to learn new Service Connect endpoints. Rollback also needs the previous network prerequisites to remain available.
 
 Manual AWS acceptance must cover private client access, allowed and denied service paths, HTTPS target health, plaintext rejection in TLS mode, task replacement, scaling, certificate rotation, and VPC enforcement/exclusions where applicable. Local checks verify configuration, prerequisite failures, and Envoy host-file aliases; Docker/Moto does not reproduce the managed Service Connect dataplane or establish a compliance certification.
+
+## Shared network prerequisites
+
+The existing VPC needs DNS support/hostnames, two private application subnets, and private database subnets spanning at least two Availability Zones. Application and database subnets may overlap. The stack creates no NAT gateways or VPC endpoints.
+
+| Caller / destination | Port | Shared network and policy requirements |
+| --- | --- | --- |
+| ECS image pulls → Docker Hub and `public.ecr.aws` | TCP 443 | Public registry, authentication, and layer-download hosts need [outbound routing](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/networking-outbound.html). Private ECR endpoints do not provide access to these registries. |
+| ECS secret injection and bootstrap → Secrets Manager | TCP 443 | Reach the region containing each secret; an interface endpoint needs private DNS and a policy permitting `GetSecretValue`, plus bootstrap's `PutSecretValue` on generated service secrets. |
+| Network prerequisite check → EC2 API | TCP 443 | VPC encryption mode requires regional `DescribeVpcEncryptionControls` access through existing egress or an interface endpoint; see [VPC enforcement](#vpc-enforcement). |
+| ECS logging → CloudWatch Logs | TCP 443 | Regional Logs endpoint or shared egress; permit execution-role `CreateLogStream` and `PutLogEvents` on the stack log group. Optional service-log retention also needs the bootstrap role's `CreateLogGroup`/`PutRetentionPolicy` access to its named service groups. |
+| Storage and certificate helpers → S3 | TCP 443 | Permit the Storage role's bucket/object and multipart actions on the stack bucket, and task-role `GetObject` on the artifact bucket's CA object. |
+| Bootstrap → CloudFormation's presigned S3 response URL | TCP 443 | S3 endpoint policies must permit the callback's signed `PutObject` to `cloudformation-custom-resource-response-<region-without-dashes>/*`. Do not restrict this solely to project buckets or the Lambda role. A CloudFormation API endpoint alone is insufficient. [AWS callback requirements](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/vpc-interface-endpoints.html). |
+| Auth → `email-smtp.<SesRegion>.amazonaws.com` | TCP 587, STARTTLS | Shared egress or an [SES SMTP interface endpoint](https://docs.aws.amazon.com/ses/latest/dg/send-email-set-up-vpc-endpoints.html) in the selected region; allow Auth's security group and verify regional/AZ availability. |
+
+Reuse an [S3 gateway endpoint](https://docs.aws.amazon.com/vpc/latest/privatelink/gateway-endpoints.html) on the application-subnet route tables for same-region Storage, certificate downloads, and callbacks. It avoids NAT data processing for that traffic and has no additional endpoint charge. Keep ownership in the surrounding infrastructure. Interface endpoints have separate costs; use existing enterprise endpoints where required. Enable their private DNS and allow the callers on the listed ports in endpoint security groups and network ACLs, including return traffic. Endpoint policies restrict access in addition to IAM and bucket/secret policies; they do not grant it.
+
+## API access and DNS
+
+The API defaults to `ApiExposure=internal`, using the private application subnets. Set `ApiClientSecurityGroupId` to the existing security group of the consuming ECS application or other approved clients; those clients also need outbound HTTPS access. Browsers and Auth email-link users must have private network access to this endpoint. For public clients, explicitly choose `ApiExposure=internet-facing` and provide `PublicSubnetIds`.
+
+If `HostedZoneId` is supplied, the stack creates the API alias in that existing zone: use a private zone associated with the VPC for internal access, or a public zone for internet-facing access. Otherwise manage the corresponding DNS yourself, pointing `ApiDomainName` at `ApiLoadBalancerDnsName`. DNS must match the supplied certificate. The API is HTTPS-only.
+
+Existing public deployments must explicitly set `ApiExposure=internet-facing` to preserve their exposure. Changing the scheme replaces the ALB and updates its DNS target; review the ALB replacement and plan a client/DNS cutover before switching an existing deployment.

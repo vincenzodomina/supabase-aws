@@ -1,10 +1,8 @@
 # Supabase on AWS
 
-This community-maintained project adapts Supabase's [official Docker Compose self-hosting setup](https://supabase.com/docs/guides/self-hosting/docker) for enterprise AWS infrastructure, with two core goals: **Amazon RDS PostgreSQL compatibility** and **scalable deployment of Supabase containers on ECS**. It delivers the essential services in one CloudFormation stack, with independent scaling and operational controls, for embedding in existing company VPCs. Supporting AWS integrations, including S3 and SES, complement these core goals.
+Supabase self-hosting for existing AWS infrastructure, built around **RDS PostgreSQL compatibility** and **independently scalable ECS services**. This community project adapts the [official Docker Compose setup](https://supabase.com/docs/guides/self-hosting/docker) into one CloudFormation stack with S3 storage, SES email, Secrets Manager, and CloudWatch logging.
 
-Bring an existing network with the selected encryption prerequisites, TLS certificate, artifact bucket, and Amazon SES configuration. The stack creates its own RDS database and Storage bucket.
-
-The stack runs Envoy, Auth, PostgREST, and S3-backed Storage as separate ECS services. Optional Studio and postgres-meta share one task and an internal HTTPS load balancer. It does not deploy Realtime, Edge Functions, Supavisor, Logflare, Vector, an email-template server, or imgproxy. Image transformation and the optional S3-compatible client API are disabled; S3 remains the required object backend.
+Envoy, Auth, PostgREST, and Storage run as separate ECS services. Optional Studio and postgres-meta share one task. The stack creates RDS and the Storage bucket; shared networking, certificates, artifact storage, and SES come from the surrounding infrastructure.
 
 ```mermaid
 flowchart TD
@@ -35,31 +33,14 @@ flowchart TD
 
 ## Requirements
 
-- An AWS account and permission to deploy CloudFormation, IAM, ECS, RDS, S3, Secrets Manager, Cloud Map, Lambda, CloudWatch, and load balancers. Optional DNS and Service Connect TLS configuration also require the corresponding Route 53, Private CA, and KMS permissions.
-- An existing VPC with DNS support/hostnames enabled, two private application subnets, and private database subnets spanning at least two Availability Zones. Application and database subnets may overlap. The default internal API requires an existing client security group in this VPC. Internet-facing access additionally requires two public subnets.
-- Internal encryption: an existing VPC in encryption-enforcement mode (default), or `InternalTrafficEncryption=service-connect-tls` with an existing AWS Private CA. See [networking prerequisites, capacity, and rollout](docs/Networking.md).
-- Shared outbound connectivity from application subnets as listed below. The stack does not create NAT gateways or VPC endpoints.
-- An existing ACM certificate in the deployment region covering the API hostname and, if enabled, the Studio hostname.
-- An existing private S3 bucket in the deployment region for templates, Lambda ZIPs, and the RDS CA bundle. The deployer needs `s3:PutObject`/`s3:GetObject`; certificate readers receive access to only their CA object. Uploads use SSE-S3 encryption. Retain artifacts while referenced by current or rollback deployments; task replacements still download the CA bundle.
-- An SES-verified sender identity with production sending access, plus a Secrets Manager JSON secret containing `username` and `password` for **SES SMTP credentials**. These are not ordinary AWS API credentials. SES identity verification, sandbox removal, quotas, and SMTP credential rotation remain account-level responsibilities.
-- If that secret uses a customer-managed KMS key, supply `SesSmtpKmsKeyArn`. The key policy must allow the generated `AuthExecutionRole` to decrypt, directly or through IAM delegation; cross-account secrets also need a secret resource policy. The stack grants decryption only through Secrets Manager for that secret, and creates no key. Leave the parameter empty for the AWS-managed Secrets Manager key.
-- AWS CLI v2, Bash, `jq`, OpenSSL, `zip`, and Python 3.13 with pip available as `python3`. AWS credentials use the normal CLI configuration, including SSO profiles. Packaging downloads hash-verified Linux wheels into a temporary directory; Docker is only needed for local integration tests.
-
-| Caller / destination | Port | Shared network and policy requirements |
-| --- | --- | --- |
-| ECS image pulls → Docker Hub and `public.ecr.aws` | TCP 443 | Public registry, authentication, and layer-download hosts need [outbound routing](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/networking-outbound.html). Private ECR endpoints do not provide access to these registries. |
-| ECS secret injection and bootstrap → Secrets Manager | TCP 443 | Reach the region containing each secret; an interface endpoint needs private DNS and a policy permitting `GetSecretValue`, plus bootstrap's `PutSecretValue` on generated service secrets. |
-| Network prerequisite check → EC2 API | TCP 443 | VPC encryption mode requires regional `DescribeVpcEncryptionControls` access through existing egress or an interface endpoint; see [Networking](docs/Networking.md). |
-| ECS logging → CloudWatch Logs | TCP 443 | Regional Logs endpoint or shared egress; permit execution-role `CreateLogStream` and `PutLogEvents` on the stack log group. Optional service-log retention also needs the bootstrap role's `CreateLogGroup`/`PutRetentionPolicy` access to its named service groups. |
-| Storage and certificate helpers → S3 | TCP 443 | Permit the Storage role's bucket/object and multipart actions on the stack bucket, and task-role `GetObject` on the artifact bucket's CA object. |
-| Bootstrap → CloudFormation's presigned S3 response URL | TCP 443 | S3 endpoint policies must permit the callback's signed `PutObject` to `cloudformation-custom-resource-response-<region-without-dashes>/*`. Do not restrict this solely to project buckets or the Lambda role. A CloudFormation API endpoint alone is insufficient. [AWS callback requirements](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/vpc-interface-endpoints.html). |
-| Auth → `email-smtp.<SesRegion>.amazonaws.com` | TCP 587, STARTTLS | Shared egress or an [SES SMTP interface endpoint](https://docs.aws.amazon.com/ses/latest/dg/send-email-set-up-vpc-endpoints.html) in the selected region; allow Auth's security group and verify regional/AZ availability. |
-
-Reuse an [S3 gateway endpoint](https://docs.aws.amazon.com/vpc/latest/privatelink/gateway-endpoints.html) on the application-subnet route tables for same-region Storage, certificate downloads, and callbacks. It avoids NAT data processing for that traffic and has no additional endpoint charge. Keep ownership in the surrounding infrastructure. Interface endpoints have separate costs; use existing enterprise endpoints where required. Enable their private DNS and allow the callers on the listed ports in endpoint security groups and network ACLs, including return traffic. Endpoint policies restrict access in addition to IAM and bucket/secret policies; they do not grant it.
+- An AWS account with stack deployment permissions and an existing VPC, private subnets across two Availability Zones, and shared outbound connectivity.
+- VPC encryption enforcement (default), or Service Connect TLS with an existing AWS Private CA. See [networking prerequisites](docs/Networking.md).
+- An ACM certificate and private artifact bucket in the deployment region, plus an SES-verified sender and SMTP credentials in Secrets Manager. See [shared resources and permissions](docs/Deployment.md#shared-resources-and-permissions).
+- AWS CLI v2, Bash, `jq`, OpenSSL, `zip`, and Python 3.13 with pip available as `python3`.
 
 ## Deploy
 
-Copy `src/parameters.example.json` to the ignored `src/parameters.json` and supply your resource IDs, hostnames, and secret ARN. The file contains references and settings, not secret values.
+Copy [src/parameters.example.json](src/parameters.example.json) to the ignored `src/parameters.json` and set the resource IDs, hostnames, and secret ARN. Parameters contain references and settings, not secret values.
 
 ```sh
 ./src/deploy.sh \
@@ -67,37 +48,12 @@ Copy `src/parameters.example.json` to the ignored `src/parameters.json` and supp
   --parameters src/parameters.json --artifacts-bucket YOUR_EXISTING_ARTIFACT_BUCKET
 ```
 
-**This command deploys immediately.** Review the source and parameters before running it. The script packages and uploads the Lambda ZIP, CA bundle, and template, then AWS CloudFormation creates and executes a change set. Rerun the same command for updates; an unchanged stack succeeds without an infrastructure update. Both a first installation and an update use **one stack deployment**.
+**This command deploys immediately.** It packages the artifacts, initializes RDS, and starts the services in one stack deployment. Rerun it for updates; unchanged stacks succeed without an infrastructure update.
 
-There is no deployment preview or saved-change-set execution mode. Offline `--template` rendering supports source inspection and consuming pipelines, but does not calculate AWS resource changes. Use the consuming pipeline's native CloudFormation approval flow when a saved change set must be reviewed before execution.
-
-Optionally pass `--role-arn ARN` to use an existing CloudFormation execution role that trusts `cloudformation.amazonaws.com` and has permission to manage the stack resources and read its artifacts. The caller needs `iam:PassRole` for that role, plus artifact-upload and CloudFormation permissions, including stack-policy access. [CloudFormation keeps the role associated with the stack](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/using-iam-servicerole.html) for later operations even when this flag is omitted; scope both role and stack access carefully.
-
-CloudFormation provisions RDS, invokes the bootstrap Lambda, and starts ECS services only after initialization succeeds. The Lambda connects to RDS with verified TLS, initializes database prerequisites, and populates service credentials. Changes to the bootstrap package or resource properties, including `CredentialRevision`, rerun initialization while preserving existing signing keys. Deleting the bootstrap resource never alters the database.
-
-The Bash deployer uploads artifacts under content-addressed S3 keys and passes `ArtifactsBucket`, `BootstrapKey`, and `CertificateKey` to the template. Keep those parameters out of your parameter file. `./src/deploy.sh --package /tmp/bootstrap.zip` produces the Lambda package without AWS credentials; Python, SQL, dependencies, and the CA bundle remain separate files under `src/`. Other pipelines can package/upload these artifacts and deploy the same template.
-
-The deployer installs a CloudFormation stack policy blocking database replacement/removal, preserving existing restrictions. It applies the policy before updates and immediately after successful first creation. Stack policies are an API setting, not a template resource; database deletion protection and snapshot policies are declared in the YAML. Each deployment creates and executes a fresh change set from the current files. Review changes before deployment; an ECS rollback does not reverse database migrations.
-
-Envoy uses its pinned official image. `src/deploy.sh` embeds `src/gateway-entrypoint.sh` into the template before upload; the `@include` marker is local packaging syntax, not a CloudFormation feature. Use `./src/deploy.sh --template > rendered.yaml` to produce the deployable template for review or another pipeline (with its S3 artifact parameters), without AWS credentials. Gateway configuration lives in `src/supabase.yaml`, and secrets are injected by ECS at task launch.
-
-The API defaults to `ApiExposure=internal`, using the private application subnets. Set `ApiClientSecurityGroupId` to the existing security group of the consuming ECS application or other approved clients; those clients also need outbound HTTPS access. Browsers and Auth email-link users must have private network access to this endpoint. For public clients, explicitly choose `ApiExposure=internet-facing` and provide `PublicSubnetIds`.
-
-If `HostedZoneId` is supplied, the stack creates the API alias in that existing zone: use a private zone associated with the VPC for internal access, or a public zone for internet-facing access. Otherwise manage the corresponding DNS yourself, pointing `ApiDomainName` at `ApiLoadBalancerDnsName`. DNS must match the supplied certificate. The API is HTTPS-only.
-
-Existing public deployments must explicitly set `ApiExposure=internet-facing` to preserve their exposure. Changing the scheme replaces the ALB and updates its DNS target; review the ALB replacement and plan a client/DNS cutover before switching an existing deployment.
-
-`ApiSecretArn` identifies the generated API credentials. Retrieve only `SUPABASE_PUBLISHABLE_KEY` for clients; keep `SUPABASE_SECRET_KEY`, legacy service-role keys, and signing keys on trusted servers. The stack never returns secret values through outputs.
-
-## Optional administration
-
-Set `EnableStudio=true`, provide `StudioDomainName`, and narrow `StudioClientCidr` to your private/VPN clients. Create the Studio DNS record pointing at `StudioLoadBalancerDnsName`; it must resolve for those clients. The certificate must cover this hostname.
-
-Studio has privileged database access. Network access is its access-control boundary in this version: there is no public administration endpoint or built-in per-user Studio login. Only trusted administrators should have access to the allowed network. postgres-meta listens within the shared task and has no load balancer or public gateway route. Disable both components together with `EnableStudio=false`.
-
-Studio snippets are ephemeral across task replacement. Store durable schema changes in your own version-controlled migrations rather than relying on Studio's local files.
-
-Fresh deployments with Studio disabled create no administration resources. Disabling an existing installation removes its administration resources from the stack but retains `MetaSecret`; re-enabling generates a new meta encryption key. Review retained secrets separately before removing them when no longer needed.
+- **Private access:** set `ApiClientSecurityGroupId` for the consuming application. Browsers and Auth email-link users also need private network access. Public access is opt-in through `ApiExposure=internet-facing` and `PublicSubnetIds`; see [access and DNS](docs/Networking.md#api-access-and-dns).
+- **Application connection:** use the `ApiUrl` output and retrieve `SUPABASE_PUBLISHABLE_KEY` from the secret identified by `ApiSecretArn`. Keep secret, service-role, and signing keys on trusted servers.
+- **Optional administration:** set `EnableStudio=true`, provide `StudioDomainName`, and restrict `StudioClientCidr`. Studio has privileged access and no built-in per-user login; see [administration setup](docs/Deployment.md#optional-administration).
+- **Embedding in other infrastructure:** reuse the source and deployment script, or package the artifacts for an existing pipeline. See [execution roles, packaging, and database protection](docs/Deployment.md#execution-and-packaging).
 
 ## Defaults and boundaries
 
@@ -118,70 +74,24 @@ Fresh deployments with Studio disabled create no administration resources. Disab
 | Logs | Application/Lambda logs: 30 days; RDS/Insights retention unchanged unless `ServiceLogRetentionDays` is set; gateway omits request URLs/tokens |
 | Task telemetry | Container Insights enabled; set `ContainerInsights=disabled` to omit paid task metrics while retaining service metrics, CPU scaling, and application logs |
 
-VPC encryption mode uses Cloud Map DNS; clients must handle task replacement and DNS refresh. Service Connect TLS adds AWS-managed proxies and certificate rotation, with additional task capacity and shared-CA prerequisites. PostgREST needs a readiness sidecar because its image does not include a shell/HTTP client. Certificate initialization uses the official AWS CLI image to copy the versioned CA bundle into a shared task volume; the probe uses the official Python image. All images are pinned by digest. There are no custom container builds or stack-owned ECR repositories.
-
-This is a deliberately limited RDS integration, not parity with the managed Supabase platform or its custom Postgres distribution. Real RDS compatibility still requires manual AWS acceptance; local PostgreSQL tests do not reproduce RDS administrator restrictions. It initializes the roles, schemas, JWT helper functions, and extensions required by the selected services. Auth and Storage apply their own release-specific schema migrations. It does not install unsupported Supabase Postgres extensions, GraphQL, database webhooks, or logical replication slots.
-
-New public-schema tables are not automatically granted to API roles. Explicitly grant intended access and enable row-level security. The privileged service role bypasses RLS by design.
-
-Set CPU/memory using valid Fargate combinations. Size service maximums and deployment surge together with RDS connection capacity; horizontal service scaling does not scale RDS. Initial per-replica pools are limited to five connections for Auth, PostgREST, and Storage, but migrations and background work can create additional connections. Retain database headroom. One replica is an explicit availability compromise.
-
-The configured pool budget at maximum scale is `5 × (AuthMaxTasks + RestMaxTasks + StorageMaxTasks)`: 60 connections at the defaults, or 120 if all three services overlap at their 200% rolling-deployment limit. This is only the configured pool component, not a total connection cap. Add headroom for listeners, migrations, bootstrap, Studio/meta, external applications, and database-reserved connections.
-
-Before production, use an approved database client to inspect the actual instance settings and connection usage:
-
-```sql
-SELECT name, setting FROM pg_settings
-WHERE name IN ('max_connections', 'superuser_reserved_connections',
-               'reserved_connections', 'rds.rds_superuser_reserved_connections');
-SELECT usename, application_name, count(*) FROM pg_stat_activity
-WHERE backend_type = 'client backend' GROUP BY usename, application_name;
-```
-
-Keep the deployment budget plus measured headroom below usable capacity; verify replacement under representative load and repeat after changing the RDS class, pool settings, or service maxima. [RDS connection limits](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/CHAP_Limits.html) depend on database configuration and memory. CloudWatch `DatabaseConnections` does not count every internal database session.
-
-If enterprise monitoring does not already cover these signals, set positive `DatabaseConnectionAlarmThreshold` and `DatabaseFreeableMemoryAlarmBytes` values, with an existing `AlarmTopicArn` for notifications. Choose a connection warning below usable capacity and a free-memory floor from workload measurements. Each alarm requires two breaching one-minute periods out of three; without a topic, alarm state remains visible in CloudWatch. Zero omits that alarm and its cost. These alerts do not enforce a connection limit or automatically resize RDS.
-
-Application Auto Scaling owns core service replica counts, so routine deployments preserve scaled capacity. New services initially start with one task; scalable-target registration raises them to their configured minimum. Verify all minimums are reached before serving traffic. Changing minimum or maximum bounds can adjust current capacity.
-
-Container Insights uses a separate performance-log group outside `LogRetentionDays`; disabling collection does not remove existing telemetry. `ServiceLogRetentionDays` optionally manages that group and RDS export groups. `StorageNoncurrentVersionRetentionDays` optionally expires old S3 versions; ordinary Storage API deletion is not permanent erasure. Both default to `0`; see [retention behavior and erasure](docs/Retention.md) before changing them.
-
-The stack incurs ongoing charges for RDS, Fargate, ALBs, storage, logs, and optional administration. Include shared networking and the selected encryption mode: VPC enforcement has shared-network charges; Service Connect TLS adds proxy capacity, certificate issuance, and managed secrets. VPC mode protects supported network paths while application traffic uses HTTP. TLS mode encrypts service-to-service proxy traffic and ALB target connections; client ingress and database connections use TLS in both modes. See [networking prerequisites and boundaries](docs/Networking.md).
+- **Limited scope:** excludes Realtime, Edge Functions, Supavisor, analytics services, imgproxy, and an email-template server. Image transformations, the S3-compatible client API, GraphQL, and database webhooks are not provided.
+- **Application access:** new tables need explicit grants and row-level security. The privileged service role bypasses RLS.
+- **Capacity and cost:** ECS scaling does not scale RDS. Choose [compute and connection budgets](docs/Compute.md) for the workload and account for shared networking and encryption costs.
+- **Data lifecycle:** API deletion is not permanent S3 erasure. Configure [retention](docs/Retention.md) to match recovery and deletion obligations.
+- **Deployment model:** pinned official images; no custom container builds, stack-owned registry, or required CI/CD pipeline.
 
 ## Validate
 
-Development checks additionally require ShellCheck and Docker for the disposable integration fixtures.
+The local suite combines script tests, template linting, and Docker/Moto integration without provisioning AWS resources. See [validation commands and coverage](CONTRIBUTION.md#validation).
 
-```sh
-python3.13 -m venv .venv
-.venv/bin/pip install --require-hashes -r tests/requirements.txt
-shellcheck src/deploy.sh src/gateway-entrypoint.sh
-./src/deploy.sh --template > /tmp/supabase.yaml
-.venv/bin/cfn-lint /tmp/supabase.yaml
-.venv/bin/python -m unittest discover -s tests -p 'test_*.py'
-./src/deploy.sh --package /tmp/bootstrap.zip
-.venv/bin/python tests/integration.py /tmp/bootstrap.zip
-.venv/bin/pip-audit -r tests/requirements.txt --disable-pip --no-deps
-```
-
-The integration test reads service images, environment settings, secrets mappings, and startup commands from the template, substituting local database and email fixtures. It loads the ZIP in the official Lambda runtime and covers verified database TLS, repeatable Lambda bootstrap with key preservation, certificate download, PostgREST readiness, Auth/Storage migrations, opaque-key translation, ES256 sessions and refresh, public JWKS safety, RLS, and excluded public routes. Docker and Moto also cover credential refresh and log-retention behavior. They do not prove RDS-specific role restrictions, ECS networking/IAM, managed encryption, or SES delivery. CI runs these checks without provisioning AWS resources; ARM64 validation is a separate [compute compatibility check](docs/Compute.md#ecs-architecture).
-
-Manual AWS acceptance is separate from the local/CI suite. Before production use, deploy an approved disposable AWS stack and verify: database bootstrap; all ECS services stable; actual signup/invitation and recovery emails through SES; token refresh and MFA; authenticated/anonymous RLS behavior; private S3 upload/download/delete and signed URLs; task replacement under traffic; Studio unreachable outside its allowed network; and snapshot restoration.
-
-From a host with private API access and the test dependencies installed, use `.venv/bin/python tests/acceptance.py --stack-name NAME --region REGION --profile PROFILE` for a Storage API round trip. It creates and deletes test data, requires access to the API secret, and leaves S3 version history subject to the bucket retention policy.
+Production use requires separate [manual AWS acceptance](docs/Deployment.md#manual-aws-acceptance). Local tests do not establish RDS-specific permissions, ECS networking, encryption enforcement, or SES delivery.
 
 ## Releases and operations
 
-Review the [Supabase self-hosting changelog](https://github.com/supabase/supabase/blob/master/docker/CHANGELOG.md) as a release set. Reconcile gateway configuration, environment variables, service migrations, and RDS compatibility before changing versions. `NOTICE` identifies the pinned upstream sources for comparison. Container tags are resolved to immutable digests. Review Python dependency updates with `uv pip compile --generate-hashes`, regenerate the source and test lock files, and rerun checks.
+Upgrade Supabase as a coordinated release set using the [upstream changelog](https://github.com/supabase/supabase/blob/master/docker/CHANGELOG.md) and pinned sources in [NOTICE](NOTICE). Back up RDS and account for S3 changes first: container rollback does not reverse database migrations.
 
-The pinned Storage release includes one-way database migrations. Do not assume changing the image back restores compatibility. Back up RDS and account for S3 object changes before an upgrade. The bootstrap Lambda is retryable and preserves signing keys; it is not a database downgrade mechanism or an automatic credential-rotation service.
+Use the [credential rotation runbook](docs/Credentials.md) for secret changes and service refresh, and the [removal guide](docs/Deployment.md#removal) for retained data and resources.
 
-Secrets injected into ECS containers are read at task launch. Follow the [credential rotation and recovery runbook](docs/Credentials.md): prepare the selected credential, then change `CredentialRevision` to rerun bootstrap and roll enabled ECS services. Changing a secret alone does not refresh running tasks, and the revision alone does not reset the RDS master password or generate new credentials. Monitor RDS connections/free storage, ECS task failures/memory, API errors/latency, and SES delivery/bounces. Protect privileged secret reads with IAM.
+Contributions are welcome; see [CONTRIBUTION.md](CONTRIBUTION.md). Discuss self-hosting experiences in the [Supabase community thread](https://github.com/orgs/supabase/discussions/39820).
 
-To remove a deployment, first disable database deletion protection explicitly. RDS snapshots, S3 data, secrets, and logs are retained by policy; review and remove retained resources separately when they are no longer needed.
-
-Contributions are welcome; see [CONTRIBUTION.md](CONTRIBUTION.md) for the workflow and contribution requirements.
-
-Discuss Supabase self-hosting setups, experiences, and ideas in the community thread [Self-hosting: What's working (and what's not)?](https://github.com/orgs/supabase/discussions/39820) on Supabase's GitHub.
-
-Inspired by [supabase-community/supabase-on-aws](https://github.com/supabase-community/supabase-on-aws). Gateway configuration is adapted from [Supabase](https://github.com/supabase/supabase), under Apache-2.0; see `NOTICE` and `LICENSE`.
+Inspired by [supabase-community/supabase-on-aws](https://github.com/supabase-community/supabase-on-aws). Gateway configuration is adapted from Supabase; see [NOTICE](NOTICE) and [LICENSE](LICENSE).
