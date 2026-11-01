@@ -2766,10 +2766,6 @@ Resources:
             - SourceVolume: certificates
               ContainerPath: /certs
               ReadOnly: true
-          Command:
-            - /bin/sh
-            - -c
-            - export DATABASE_SSL_ROOT_CERT="$(cat /certs/rds-ca.pem)"; exec node dist/start/server.js
       Volumes:
         - Name: certificates
       TaskRoleArn: !GetAtt 'StorageRole.Arn'
@@ -2989,10 +2985,6 @@ Resources:
               ValueFrom: !Sub '${DatabaseSecret}:password::'
             - Name: CRYPTO_KEY
               ValueFrom: !Sub '${MetaSecret}:crypto_key::'
-          Command:
-            - /bin/sh
-            - -c
-            - export PG_META_DB_SSL_ROOT_CERT="$(cat /certs/rds-ca.pem)"; exec node /usr/src/app/dist/server/server.js
           MountPoints:
             - SourceVolume: certificates
               ContainerPath: /certs
