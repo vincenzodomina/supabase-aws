@@ -12,9 +12,15 @@ The [README quick start](../README.md#deploy) deploys the stack in one command. 
 
 See [networking](Networking.md) for subnets, private clients, DNS, outbound access, and encryption prerequisites.
 
+## Embedding source
+
+Copy `src/` into any directory in the consuming repository, preserving its internal layout and the applicable `LICENSE` and `NOTICE` attribution. Runtime source consists of `supabase.yaml`, `gateway-entrypoint.sh`, `bootstrap.py`, `migrations/`, `rds-ca.pem`, and the pinned `requirements.txt`; retain `requirements.in` for dependency maintenance. Keep `deploy.sh` for the existing render/package/deploy entry points, and use your own parameter file (`parameters.example.json` is only an example). No repository-root layout or upstream download is required at deployment time, apart from the pinned package and container dependencies.
+
+The consuming pipeline can call the copied deployer directly, or use `--template` and `--package`, upload the rendered template, ZIP and CA bundle to its artifact bucket, and supply `ArtifactsBucket`, `BootstrapKey`, and `CertificateKey` to CloudFormation. A pipeline deploying without the script also owns installation of the [stack policy](#execution-and-packaging). Copying source does not import existing AWS resources or migrate data; preserve resource identities and plan database adoption separately.
+
 ## Execution and packaging
 
-Run commands from the repository root with the tools listed in the [README](../README.md#requirements). Packaging downloads hash-verified Linux wheels; Docker is only required for local integration tests.
+Examples use repository-root paths and the tools listed in the [README](../README.md#requirements). The deployer resolves source files beside itself; parameter and package-output paths are relative to the caller's working directory. Packaging downloads hash-verified Linux wheels; Docker is only required for local integration tests.
 
 The deploy command packages and uploads the template, Lambda ZIP, and CA bundle, then creates and executes a CloudFormation change set. Repeated deployments use current inputs; an unchanged stack succeeds. There is no built-in preview or saved-change-set execution mode. Use the consuming pipeline's native approval flow if required.
 
@@ -24,7 +30,7 @@ CloudFormation provisions RDS, invokes the bootstrap Lambda, and starts ECS serv
 
 The Bash deployer uploads artifacts under content-addressed S3 keys and passes `ArtifactsBucket`, `BootstrapKey`, and `CertificateKey` to the template. Keep those parameters out of your parameter file. `./src/deploy.sh --package /tmp/bootstrap.zip` produces the Lambda package without AWS credentials; Python, SQL, dependencies, and the CA bundle remain separate files under `src/`. Other pipelines can package/upload these artifacts and deploy the same template.
 
-The deployer installs a CloudFormation stack policy blocking database replacement/removal, preserving existing restrictions. It applies the policy before updates and immediately after successful first creation. Stack policies are an API setting, not a template resource; database deletion protection and snapshot policies are declared in the YAML. Each deployment creates and executes a fresh change set from the current files. Review changes before deployment; an ECS rollback does not reverse database migrations.
+The deployer installs a [CloudFormation stack policy](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/protect-stack-resources.html) blocking replacement/removal of all RDS instances and S3 buckets in the stack by resource type, preserving existing restrictions. It applies the policy before updates and immediately after successful first creation. Stack policies are an API setting, not a template resource, and apply only to stack updates, not full-stack deletion or direct service operations. Database deletion protection, snapshots, and bucket retention remain declared in the YAML. Review changes before deployment; an ECS rollback does not reverse database migrations.
 
 Envoy uses its pinned official image. `src/deploy.sh` embeds `src/gateway-entrypoint.sh` into the template before upload; the `@include` marker is local packaging syntax, not a CloudFormation feature. Use `./src/deploy.sh --template > rendered.yaml` to produce the deployable template for review or another pipeline (with its S3 artifact parameters), without AWS credentials. Gateway configuration lives in `src/supabase.yaml`, and secrets are injected by ECS at task launch.
 

@@ -1252,7 +1252,7 @@ Resources:
           Image: envoyproxy/envoy:v1.39.1@sha256:57e14a549d7bd43c8d3f6d03e8cfa653e037d4b38e133acd9b54f38c524401b4
           EntryPoint: [/bin/sh, -ec]
           Command:
-            - "@include src/gateway-entrypoint.sh"
+            - "@include gateway-entrypoint.sh"
           PortMappings:
             - Name: gateway
               AppProtocol: http

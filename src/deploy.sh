@@ -10,8 +10,8 @@
 # ┃  2. Load Parameters and Embed the Gateway Script                    ┃
 # ┃  3. Inspect the Existing Stack                                     ┃
 # ┃  4. Package and Upload Versioned Lambda and Certificate Artifacts   ┃
-# ┃  5. Protect the Existing Database                                  ┃
-# ┃  6. Deploy the Stack and Protect a Newly Created Database           ┃
+# ┃  5. Protect Existing Databases and Buckets                          ┃
+# ┃  6. Deploy the Stack and Protect Newly Created Data Resources       ┃
 # ┃                                                                    ┃
 # ┃  CloudFormation runs database initialization before services.      ┃
 # ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
@@ -19,7 +19,7 @@
 ########## 1. Parse Options and Check Required Tools ##########
 
 set -euo pipefail
-project_dir=$(cd "$(dirname "$0")/.." && pwd)
+source_dir=$(cd "$(dirname "$0")" && pwd)
 
 usage() {
   echo "Usage: $0 --stack-name NAME --region REGION --parameters FILE --artifacts-bucket BUCKET [--profile PROFILE] [--role-arn ARN]"
@@ -28,20 +28,20 @@ usage() {
 }
 
 render_template() (
-  cd "$project_dir"
+  cd "$source_dir"
   awk '
-    /^ *- "@include src\/gateway-entrypoint.sh"$/ {
+    /^ *- "@include gateway-entrypoint.sh"$/ {
       sub(/-.*/, "")
       print $0 "- |"
-      while ((result = getline line < "src/gateway-entrypoint.sh") > 0) print $0 "  " line
+      while ((result = getline line < "gateway-entrypoint.sh") > 0) print $0 "  " line
       if (result < 0) exit 1
-      close("src/gateway-entrypoint.sh")
+      close("gateway-entrypoint.sh")
       included++
       next
     }
     { print }
     END { if (included != 1) exit 1 }
-  ' src/supabase.yaml
+  ' supabase.yaml
 )
 
 package_lambda() (
@@ -51,9 +51,9 @@ package_lambda() (
   # Download Lambda-compatible wheels on either macOS or Linux; never build native code locally.
   python3 -m pip install --disable-pip-version-check --no-compile --require-hashes --only-binary=:all: \
     --platform manylinux_2_34_x86_64 --platform manylinux_2_28_x86_64 --platform manylinux2014_x86_64 \
-    --implementation cp --python-version 3.13 --target "$package_dir/files" -r "$project_dir/src/requirements.txt"
-  cp "$project_dir"/src/{bootstrap.py,rds-ca.pem} "$package_dir/files/"
-  cp -R "$project_dir/src/migrations" "$package_dir/files/"
+    --implementation cp --python-version 3.13 --target "$package_dir/files" -r "$source_dir/requirements.txt"
+  cp "$source_dir"/{bootstrap.py,rds-ca.pem} "$package_dir/files/"
+  cp -R "$source_dir/migrations" "$package_dir/files/"
   cd "$package_dir/files"
   # Stable metadata makes unchanged inputs reuse the same content-addressed S3 object.
   find . -type d -exec chmod 755 {} +
@@ -102,7 +102,6 @@ if ! jq -e 'type == "object" and (has("ArtifactsBucket") | not) and (has("Bootst
 fi
 overrides=()
 while IFS= read -r value; do overrides+=("$value"); done < <(jq -r 'to_entries[] | "\(.key)=\(.value)"' "$parameters")
-cd "$project_dir"
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
 render_template > "$scratch/supabase.yaml"
@@ -122,7 +121,7 @@ fi
 
 package_lambda "$scratch/bootstrap.zip"
 bootstrap_key="supabase-aws/bootstrap/$(openssl dgst -sha256 -r "$scratch/bootstrap.zip" | cut -d' ' -f1).zip"
-certificate_key="supabase-aws/certificates/$(openssl dgst -sha256 -r src/rds-ca.pem | cut -d' ' -f1).pem"
+certificate_key="supabase-aws/certificates/$(openssl dgst -sha256 -r "$source_dir/rds-ca.pem" | cut -d' ' -f1).pem"
 
 upload_artifact() {
   if aws s3api put-object --bucket "$artifacts_bucket" --key "$2" --body "$1" \
@@ -136,31 +135,32 @@ upload_artifact() {
   fi
 }
 upload_artifact "$scratch/bootstrap.zip" "$bootstrap_key"
-upload_artifact src/rds-ca.pem "$certificate_key"
+upload_artifact "$source_dir/rds-ca.pem" "$certificate_key"
 overrides+=("ArtifactsBucket=$artifacts_bucket" "BootstrapKey=$bootstrap_key" "CertificateKey=$certificate_key")
 
-########## 5. Protect the Existing Database ##########
+########## 5. Protect Existing Databases and Buckets ##########
 
-protect_database() {
+protect_data() {
   local policy
-  # Preserve any additional restrictions while blocking destructive database updates.
+  # Protect data independently of logical IDs and preserve any existing restrictions.
   policy=$(aws cloudformation get-stack-policy --stack-name "$stack_name" --output json)
   policy=$(jq -c '(.StackPolicyBody | if . then fromjson else
     {Statement: [{Effect:"Allow", Action:"Update:*", Principal:"*", Resource:"*"}]} end)
-    | .Statement += [{Effect:"Deny", Action:["Update:Replace","Update:Delete"], Principal:"*", Resource:"LogicalResourceId/Database"}]
+    | .Statement += [{Effect:"Deny", Action:["Update:Replace","Update:Delete"], Principal:"*", Resource:"*",
+        Condition:{StringEquals:{ResourceType:["AWS::RDS::DBInstance","AWS::S3::Bucket"]}}}]
     | .Statement |= unique' <<<"$policy")
   aws cloudformation set-stack-policy --stack-name "$stack_name" --stack-policy-body "$policy"
 }
 new_stack=false
 if [[ "$status" == NEW || "$status" == REVIEW_IN_PROGRESS ]]; then new_stack=true; fi
-if ! "$new_stack"; then protect_database; fi
+if ! "$new_stack"; then protect_data; fi
 
-########## 6. Deploy the Stack and Protect a Newly Created Database ##########
+########## 6. Deploy the Stack and Protect Newly Created Data Resources ##########
 
 options=(--no-fail-on-empty-changeset)
 if [[ -n "$role_arn" ]]; then options+=(--role-arn "$role_arn"); fi
 aws cloudformation deploy --stack-name "$stack_name" --template-file "$scratch/supabase.yaml" \
   --s3-bucket "$artifacts_bucket" --s3-prefix "supabase-aws/$stack_name" \
   --capabilities CAPABILITY_IAM --parameter-overrides "${overrides[@]}" "${options[@]}"
-if "$new_stack"; then protect_database; fi
+if "$new_stack"; then protect_data; fi
 echo 'Stack deployment complete. Run the README acceptance checks before serving users.'

@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -47,12 +48,19 @@ elif command == ['cloudformation', 'get-stack-policy']:
     if scenario == 'policy-read-denied': sys.exit('AccessDenied: cannot read policy')
     if scenario in ['new', 'review']:
         print('{}'); sys.exit(0)
-    print(json.dumps({'StackPolicyBody': json.dumps({'Statement': [
+    statements = [
         {'Effect': 'Allow', 'Action': 'Update:*', 'Principal': '*', 'Resource': '*'},
-        {'Effect': 'Deny', 'Action': 'Update:Delete', 'Principal': '*', 'Resource': 'LogicalResourceId/Bucket'}]})}))
+        {'Effect': 'Deny', 'Action': 'Update:Delete', 'Principal': '*', 'Resource': 'LogicalResourceId/Bucket'},
+        {'Effect': 'Deny', 'Action': ['Update:Replace', 'Update:Delete'], 'Principal': '*', 'Resource': 'LogicalResourceId/Database'}]
+    if scenario == 'cached':
+        statements.append({'Effect': 'Deny', 'Action': ['Update:Replace', 'Update:Delete'], 'Principal': '*', 'Resource': '*',
+                           'Condition': {'StringEquals': {'ResourceType': ['AWS::RDS::DBInstance', 'AWS::S3::Bucket']}}})
+    print(json.dumps({'StackPolicyBody': json.dumps({'Statement': statements})}))
 elif command == ['cloudformation', 'set-stack-policy']:
     if scenario == 'policy-write-denied': sys.exit('AccessDenied: cannot set policy')
 elif command == ['s3api', 'put-object']:
+    source = pathlib.Path(args[args.index('--body')+1])
+    (root/source.name).write_bytes(source.read_bytes())
     if scenario in ['cached', 'empty']: sys.exit('PreconditionFailed: object exists')
     if scenario == 'upload-denied': sys.exit('AccessDenied: cannot write artifact')
 else: sys.exit('Unexpected CLI call: '+repr(args))
@@ -60,7 +68,7 @@ else: sys.exit('Unexpected CLI call: '+repr(args))
 
 
 class DeploymentTest(unittest.TestCase):
-    def run_deploy(self, scenario, parameters=None, role_arn=None, extra_args=()):
+    def run_deploy(self, scenario, parameters=None, role_arn=None, extra_args=(), source=ROOT/'src'):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             for tool in ['aws', 'python3']:
@@ -69,7 +77,7 @@ class DeploymentTest(unittest.TestCase):
                 path.chmod(0o755)
             params = root/'parameters.json'
             params.write_text(json.dumps(parameters if parameters is not None else {'SiteUrl': 'https://example.com/a b'}))
-            args = ['bash', str(ROOT/'src/deploy.sh'), '--stack-name', 'demo', '--region', 'us-east-1',
+            args = ['bash', str(source/'deploy.sh'), '--stack-name', 'demo', '--region', 'us-east-1',
                     '--parameters', params.name, '--artifacts-bucket', 'artifacts']
             args.extend(extra_args)
             if role_arn is not None:
@@ -79,9 +87,16 @@ class DeploymentTest(unittest.TestCase):
                                              CLI_FIXTURE=directory, SCENARIO=scenario), timeout=30)
             calls = [json.loads(line) for line in (root/'calls').read_text().splitlines()] if (root/'calls').exists() else []
             self.template = (root/'template').read_text() if (root/'template').exists() else None
+            self.artifacts = {name: (root/name).read_bytes() for name in ['bootstrap.zip', 'rds-ca.pem'] if (root/name).exists()}
+            for call in calls:
+                if call[:3] == ['aws', 'cloudformation', 'set-stack-policy']:
+                    statements = json.loads(call[call.index('--stack-policy-body')+1])['Statement']
+                    protection = {'Effect': 'Deny', 'Action': ['Update:Replace', 'Update:Delete'], 'Principal': '*', 'Resource': '*',
+                                  'Condition': {'StringEquals': {'ResourceType': ['AWS::RDS::DBInstance', 'AWS::S3::Bucket']}}}
+                    self.assertEqual(statements.count(protection), 1)
             return result, calls
 
-    def test_default_deployment_uploads_artifacts_and_protects_created_database(self):
+    def test_default_deployment_uploads_artifacts_and_protects_created_data(self):
         role = 'arn:aws:iam::123456789012:role/platform/cloudformation'
         for scenario in ['new', 'review']:
             with self.subTest(scenario=scenario):
@@ -172,14 +187,25 @@ class DeploymentTest(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(calls, [])
 
-    def test_unchanged_package_reuses_content_address(self):
-        keys = []
-        for _ in range(2):
+    def test_copied_source_preserves_rendering_and_artifact_content(self):
+        with tempfile.TemporaryDirectory() as directory:
+            copied = Path(directory)/'embedded infra'/'supabase'
+            shutil.copytree(ROOT/'src', copied)
+            expected = subprocess.check_output([str(ROOT/'src/deploy.sh'), '--template'])
+            rendered = subprocess.check_output([str(copied/'deploy.sh'), '--template'], cwd=directory)
+            self.assertEqual(rendered, expected)
             result, calls = self.run_deploy('new')
             self.assertEqual(result.returncode, 0, result.stderr)
             deployment = next(c for c in calls if c[:3] == ['aws', 'cloudformation', 'deploy'])
-            keys.append(next(c for c in deployment if c.startswith('BootstrapKey=')))
-        self.assertEqual(keys[0], keys[1])
+            key = next(c for c in deployment if c.startswith('BootstrapKey='))
+            artifacts = self.artifacts
+            self.assertEqual(artifacts['rds-ca.pem'], (ROOT/'src/rds-ca.pem').read_bytes())
+            result, calls = self.run_deploy('new', source=copied)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            deployment = next(c for c in calls if c[:3] == ['aws', 'cloudformation', 'deploy'])
+            self.assertIn(key, deployment)
+            self.assertEqual(self.artifacts, artifacts)
+            self.assertEqual(self.template, expected.decode())
 
 
 class ArtifactTest(unittest.TestCase):
