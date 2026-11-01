@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: Supabase on ECS Fargate with RDS PostgreSQL and S3; existing network and SES required.
+Description: Supabase on ECS Fargate with RDS PostgreSQL and S3; existing network and email delivery required.
 Parameters:
   VpcId:
     Type: AWS::EC2::VPC::Id
@@ -72,18 +72,55 @@ Parameters:
     Type: String
     Description: Comma-separated Auth redirect allow list.
     Default: ''
+  EmailMode:
+    Type: String
+    AllowedValues: [smtp, hook]
+    Default: smtp
+    Description: SES SMTP by default, or an existing HTTPS send-email hook.
+  EmailHookUri:
+    Type: String
+    Default: ''
+    AllowedPattern: '(^$|https://[^\s]+)'
+    Description: Existing HTTPS send-email hook endpoint; required in hook mode.
+  EmailHookSecretArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '(^$|arn:[^:]+:secretsmanager:[^:]+:[0-9]{12}:secret:.+)'
+    Description: Existing Secrets Manager JSON with a secret field containing the Auth hook signing secret.
+  EmailHookKmsKeyArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '(^$|arn:[^:]+:kms:[^:]+:[0-9]{12}:key/[a-zA-Z0-9-]+)'
+    Description: Optional customer-managed key for the hook secret; its policy must permit AuthExecutionRole.
+  EnablePhoneSignup:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'false'
+    Description: Enable phone authentication. SMS delivery is not provisioned by this stack.
+  EnablePhoneAutoconfirm:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'false'
+    Description: Confirm phone numbers without SMS verification; enable only deliberately.
+  EnableEmailAutoconfirm:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'false'
+    Description: Confirm email addresses without verification; enable only deliberately.
   SesRegion:
     Type: String
     Description: Region containing the verified SES identity and SMTP credentials.
     Default: us-east-1
   SesSenderEmail:
     Type: String
-    Description: Verified SES sender email address.
-    AllowedPattern: '[^\s@]+@[^\s@]+'
+    Description: Verified SES sender email address; required in SMTP mode.
+    Default: ''
+    AllowedPattern: '(^$|[^\s@]+@[^\s@]+)'
   SesSmtpSecretArn:
     Type: String
     Description: Existing Secrets Manager JSON secret with username and password (SES SMTP credentials).
-    AllowedPattern: arn:[^:]+:secretsmanager:[^:]+:[0-9]{12}:secret:.+
+    Default: ''
+    AllowedPattern: '(^$|arn:[^:]+:secretsmanager:[^:]+:[0-9]{12}:secret:.+)'
   SesSmtpKmsKeyArn:
     Type: String
     Description: Existing customer-managed KMS key for the SMTP secret; empty for the AWS-managed key. Its key policy must permit AuthExecutionRole.
@@ -328,6 +365,11 @@ Parameters:
     MinValue: 0
     Description: Alert below this measured free-memory floor in bytes. Zero omits the alarm for externally managed monitoring.
 Conditions:
+  UseSmtp: !Equals [!Ref EmailMode, smtp]
+  UseEmailHook: !Equals [!Ref EmailMode, hook]
+  HasSesSmtpSecret: !And [!Condition UseSmtp, !Not [!Equals [!Ref SesSmtpSecretArn, '']]]
+  HasEmailHookSecret: !And [!Condition UseEmailHook, !Not [!Equals [!Ref EmailHookSecretArn, '']]]
+  HasEmailHookKmsKey: !And [!Condition UseEmailHook, !Not [!Equals [!Ref EmailHookKmsKeyArn, '']]]
   GatewayTlsCpuFloor: !And [!Condition UseServiceConnectTls, !Equals [!Ref 'GatewayCpu', '256']]
   GatewayTlsMemoryFloor: !And [!Condition UseServiceConnectTls, !Equals [!Ref 'GatewayMemory', '512']]
   AuthTlsCpuFloor: !And [!Condition UseServiceConnectTls, !Equals [!Ref 'AuthCpu', '256']]
@@ -353,10 +395,7 @@ Conditions:
   ManagePrivateApiIngress: !And
     - !Equals [!Ref 'ApiExposure', internal]
     - !Equals [!Ref 'ManageApiIngress', 'true']
-  HasSesSmtpKmsKey: !Not
-    - !Equals
-      - !Ref 'SesSmtpKmsKeyArn'
-      - ''
+  HasSesSmtpKmsKey: !And [!Condition UseSmtp, !Not [!Equals [!Ref SesSmtpKmsKeyArn, '']]]
   RunStudio: !Equals
     - !Ref 'EnableStudio'
     - 'true'
@@ -722,6 +761,7 @@ Resources:
       ToPort: 5432
   AuthSmtp:
     Type: AWS::EC2::SecurityGroupEgress
+    Condition: UseSmtp
     Properties:
       GroupId: !Ref 'AuthSG'
       IpProtocol: tcp
@@ -936,7 +976,8 @@ Resources:
                 Resource:
                   - !Ref 'AuthSecret'
                   - !Ref 'ApiSecret'
-                  - !Ref 'SesSmtpSecretArn'
+                  - !If [HasSesSmtpSecret, !Ref SesSmtpSecretArn, !Ref AWS::NoValue]
+                  - !If [HasEmailHookSecret, !Ref EmailHookSecretArn, !Ref AWS::NoValue]
               - !If
                 - HasSesSmtpKmsKey
                 - Effect: Allow
@@ -948,6 +989,18 @@ Resources:
                         - 'secretsmanager.${SecretRegion}.${AWS::URLSuffix}'
                         - SecretRegion: !Select [3, !Split [':', !Ref 'SesSmtpSecretArn']]
                       kms:EncryptionContext:SecretARN: !Ref 'SesSmtpSecretArn'
+                - !Ref 'AWS::NoValue'
+              - !If
+                - HasEmailHookKmsKey
+                - Effect: Allow
+                  Action: kms:Decrypt
+                  Resource: !Ref 'EmailHookKmsKeyArn'
+                  Condition:
+                    StringEquals:
+                      kms:ViaService: !Sub
+                        - 'secretsmanager.${SecretRegion}.${AWS::URLSuffix}'
+                        - SecretRegion: !Select [3, !Split [':', !Ref 'EmailHookSecretArn']]
+                      kms:EncryptionContext:SecretARN: !Ref 'EmailHookSecretArn'
                 - !Ref 'AWS::NoValue'
   RestExecutionRole:
     Type: AWS::IAM::Role
@@ -2298,19 +2351,40 @@ Resources:
             - Name: GOTRUE_EXTERNAL_EMAIL_ENABLED
               Value: 'true'
             - Name: GOTRUE_EXTERNAL_PHONE_ENABLED
-              Value: 'false'
+              Value: !Ref EnablePhoneSignup
+            - Name: GOTRUE_SMS_AUTOCONFIRM
+              Value: !Ref EnablePhoneAutoconfirm
             - Name: GOTRUE_EXTERNAL_ANONYMOUS_USERS_ENABLED
               Value: 'false'
             - Name: GOTRUE_MAILER_AUTOCONFIRM
-              Value: 'false'
-            - Name: GOTRUE_SMTP_HOST
-              Value: !Sub 'email-smtp.${SesRegion}.${AWS::URLSuffix}'
-            - Name: GOTRUE_SMTP_PORT
-              Value: '587'
-            - Name: GOTRUE_SMTP_ADMIN_EMAIL
-              Value: !Ref 'SesSenderEmail'
-            - Name: GOTRUE_SMTP_SENDER_NAME
-              Value: Supabase
+              Value: !Ref EnableEmailAutoconfirm
+            - Name: GOTRUE_HOOK_SEND_EMAIL_ENABLED
+              Value: !If [UseEmailHook, 'true', 'false']
+            - !If
+              - UseEmailHook
+              - Name: GOTRUE_HOOK_SEND_EMAIL_URI
+                Value: !Ref EmailHookUri
+              - !Ref AWS::NoValue
+            - !If
+              - UseSmtp
+              - Name: GOTRUE_SMTP_HOST
+                Value: !Sub 'email-smtp.${SesRegion}.${AWS::URLSuffix}'
+              - !Ref AWS::NoValue
+            - !If
+              - UseSmtp
+              - Name: GOTRUE_SMTP_PORT
+                Value: '587'
+              - !Ref AWS::NoValue
+            - !If
+              - UseSmtp
+              - Name: GOTRUE_SMTP_ADMIN_EMAIL
+                Value: !Ref 'SesSenderEmail'
+              - !Ref AWS::NoValue
+            - !If
+              - UseSmtp
+              - Name: GOTRUE_SMTP_SENDER_NAME
+                Value: Supabase
+              - !Ref AWS::NoValue
             - Name: GOTRUE_MAILER_URLPATHS_INVITE
               Value: /auth/v1/verify
             - Name: GOTRUE_MAILER_URLPATHS_CONFIRMATION
@@ -2324,16 +2398,27 @@ Resources:
             - Name: GOTRUE_MFA_TOTP_VERIFY_ENABLED
               Value: 'true'
           Secrets:
+            - !If
+              - UseEmailHook
+              - Name: GOTRUE_HOOK_SEND_EMAIL_SECRETS
+                ValueFrom: !Sub '${EmailHookSecretArn}:secret::'
+              - !Ref AWS::NoValue
             - Name: GOTRUE_DB_DATABASE_URL
               ValueFrom: !Sub '${AuthSecret}:uri::'
             - Name: GOTRUE_JWT_SECRET
               ValueFrom: !Sub '${ApiSecret}:JWT_SECRET::'
             - Name: GOTRUE_JWT_KEYS
               ValueFrom: !Sub '${ApiSecret}:JWT_KEYS::'
-            - Name: GOTRUE_SMTP_USER
-              ValueFrom: !Sub '${SesSmtpSecretArn}:username::'
-            - Name: GOTRUE_SMTP_PASS
-              ValueFrom: !Sub '${SesSmtpSecretArn}:password::'
+            - !If
+              - UseSmtp
+              - Name: GOTRUE_SMTP_USER
+                ValueFrom: !Sub '${SesSmtpSecretArn}:username::'
+              - !Ref AWS::NoValue
+            - !If
+              - UseSmtp
+              - Name: GOTRUE_SMTP_PASS
+                ValueFrom: !Sub '${SesSmtpSecretArn}:password::'
+              - !Ref AWS::NoValue
           HealthCheck:
             Command:
               - CMD-SHELL
@@ -3331,3 +3416,17 @@ Rules:
             - !Ref 'StudioDomainName'
             - ''
         AssertDescription: Provide StudioDomainName covered by CertificateArn when enabling Studio.
+  SmtpRequiresCredentials:
+    RuleCondition: !Equals [!Ref EmailMode, smtp]
+    Assertions:
+      - Assert: !And
+          - !Not [!Equals [!Ref SesSmtpSecretArn, '']]
+          - !Not [!Equals [!Ref SesSenderEmail, '']]
+        AssertDescription: Provide SesSmtpSecretArn and SesSenderEmail for SMTP email.
+  EmailHookRequiresEndpoint:
+    RuleCondition: !Equals [!Ref EmailMode, hook]
+    Assertions:
+      - Assert: !And
+          - !Not [!Equals [!Ref EmailHookUri, '']]
+          - !Not [!Equals [!Ref EmailHookSecretArn, '']]
+        AssertDescription: Provide EmailHookUri and EmailHookSecretArn for hook email.
