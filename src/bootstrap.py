@@ -1,4 +1,4 @@
-"""Initialize a dedicated RDS database; services own their versioned schema migrations."""
+"""Provision RDS prerequisites and optional retention for service-created log groups."""
 import base64
 import hashlib
 import hmac
@@ -119,25 +119,50 @@ def bootstrap(properties):
     print('Database prerequisites and service credentials are ready.')
 
 
+def retain_service_logs(properties):
+    client = boto3.client('logs', config=Config(
+        connect_timeout=5, read_timeout=10, retries={'mode': 'standard', 'total_max_attempts': 3}))
+    days = int(properties['RetentionInDays'])
+    for name in properties['LogGroups']:
+        try:
+            client.put_retention_policy(logGroupName=name, retentionInDays=days)
+        except client.exceptions.ResourceNotFoundException:
+            if name not in properties['CreateLogGroups']:
+                continue
+            try:
+                client.create_log_group(logGroupName=name)
+            except client.exceptions.ResourceAlreadyExistsException:
+                pass  # The AWS service can create the group between these calls.
+            client.put_retention_policy(logGroupName=name, retentionInDays=days)
+
+
 def handler(event, context):
-    physical_id = event.get('PhysicalResourceId', event['StackId'] + '/database-bootstrap')
-    status, reason = 'SUCCESS', 'Database bootstrap completed'
+    retention = event['ResourceType'] == 'Custom::ServiceLogRetention'
+    operation = 'Service log retention' if retention else 'Database bootstrap'
+    suffix = '/service-log-retention' if retention else '/database-bootstrap'
+    physical_id = event.get('PhysicalResourceId', event['StackId'] + suffix)
+    status, reason = 'SUCCESS', operation + ' completed'
 
     def timeout(signum, frame):
-        raise TimeoutError('Bootstrap deadline reached')
+        raise TimeoutError('Custom resource deadline reached')
 
     previous = signal.signal(signal.SIGALRM, timeout)
     try:
         if event['RequestType'] != 'Delete':
+            if event['ResourceType'] not in ('Custom::DatabaseBootstrap', 'Custom::ServiceLogRetention'):
+                raise ValueError('Unsupported custom resource type')
             seconds = context.get_remaining_time_in_millis() / 1000 - 30
             if seconds <= 0:
-                raise TimeoutError('Insufficient time to initialize the database')
+                raise TimeoutError('Insufficient time to handle the custom resource')
             # Leave time to report failure before Lambda terminates the invocation.
             signal.setitimer(signal.ITIMER_REAL, seconds)
-            bootstrap(event['ResourceProperties'])
+            if retention:
+                retain_service_logs(event['ResourceProperties'])
+            else:
+                bootstrap(event['ResourceProperties'])
     except Exception as error:
-        print(f'Bootstrap failed: {type(error).__name__}; request {event["RequestId"]}')
-        status, reason = 'FAILED', 'Database bootstrap failed; inspect the Lambda log stream.'
+        print(f'{operation} failed: {type(error).__name__}; request {event["RequestId"]}')
+        status, reason = 'FAILED', operation + ' failed; inspect the Lambda log stream.'
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, previous)

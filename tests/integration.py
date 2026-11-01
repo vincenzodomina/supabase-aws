@@ -9,7 +9,6 @@ import os
 from pathlib import Path
 import re
 import secrets
-import socket
 import subprocess
 import sys
 import tempfile
@@ -107,6 +106,7 @@ def run(directory, package):
     config = Config(connect_timeout=5, read_timeout=10, retries={'total_max_attempts': 1}, s3={'addressing_style': 'path'})
     s3 = session.client('s3', endpoint_url=f'http://127.0.0.1:{motoport}', config=config)
     sm = session.client('secretsmanager', endpoint_url=f'http://127.0.0.1:{motoport}', config=config)
+    logs = session.client('logs', endpoint_url=f'http://127.0.0.1:{motoport}', config=config)
     internal_s3 = session.client('s3', endpoint_url='http://moto:5000', config=config)
     for bucket in ['artifacts', 'integration']:
         s3.create_bucket(Bucket=bucket)
@@ -150,24 +150,26 @@ def run(directory, package):
     else:
         raise RuntimeError('Postgres startup timed out')
 
-    lambda_env = dict(aws_env, AWS_ENDPOINT_URL_SECRETS_MANAGER='http://moto:5000')
+    lambda_env = dict(aws_env, AWS_ENDPOINT_URL_SECRETS_MANAGER='http://moto:5000', AWS_ENDPOINT_URL_CLOUDWATCH_LOGS='http://moto:5000')
     mounts = [str(directory/'lambda')+':/var/task:ro']
     badport = start('lambda-untrusted', LAMBDA_IMAGE, lambda_env, 8080, mounts=mounts, command=[runtime['Handler']])
     lambdaport = start('lambda', LAMBDA_IMAGE, lambda_env, 8080,
                        mounts=mounts+[str(directory/'rds-ca.pem')+':/var/task/rds-ca.pem:ro'], command=[runtime['Handler']])
 
-    def invoke(port, request_type, expected='SUCCESS', physical_id=None):
+    def invoke(port, request_type, expected='SUCCESS', physical_id=None,
+               resource_type='Custom::DatabaseBootstrap', resource_properties=None):
         for _ in range(60):
             try:
-                with socket.create_connection(('127.0.0.1', port), timeout=1):
-                    break
+                request(f'http://127.0.0.1:{port}/', timeout=1)
+                break
             except OSError:
                 time.sleep(1)
         else:
             raise RuntimeError('Lambda runtime startup timed out')
         request_id = secrets.token_hex(8)
-        event = {'RequestType': request_type, 'StackId': 'stack', 'RequestId': request_id,
-                 'LogicalResourceId': 'Bootstrap', 'ResourceProperties': properties,
+        event = {'RequestType': request_type, 'ResourceType': resource_type, 'StackId': 'stack', 'RequestId': request_id,
+                 'LogicalResourceId': 'ServiceLogRetention' if resource_type == 'Custom::ServiceLogRetention' else 'Bootstrap',
+                 'ResourceProperties': properties if resource_properties is None else resource_properties,
                  'ResponseURL': internal_s3.generate_presigned_url('put_object', Params={'Bucket': 'artifacts', 'Key': request_id}, ExpiresIn=300)}
         if physical_id:
             event['PhysicalResourceId'] = physical_id
@@ -176,9 +178,34 @@ def run(directory, package):
         response = s3.get_object(Bucket='artifacts', Key=request_id)['Body'].read()
         assert len(response) <= 4096
         response = json.loads(response)
-        assert response['Status'] == expected, 'Bootstrap returned '+response['Status']
+        assert response['Status'] == expected, resource_type+' returned '+response['Status']
         assert response['RequestId'] == request_id
         return response['PhysicalResourceId']
+
+    groups = ['/aws/rds/instance/test/postgresql', '/aws/rds/instance/test/upgrade',
+              '/aws/ecs/containerinsights/test/performance']
+    logs.create_log_group(logGroupName=groups[0], tags={'owner': 'existing'})
+    logs.create_log_stream(logGroupName=groups[0], logStreamName='existing')
+    logs.put_log_events(logGroupName=groups[0], logStreamName='existing',
+                        logEvents=[{'timestamp': int(time.time()*1000), 'message': 'retained history'}])
+    logs.create_log_group(logGroupName='unrelated')
+    retention = {'LogGroups': groups, 'CreateLogGroups': groups[:2], 'RetentionInDays': '30'}
+    retention_args = dict(resource_type='Custom::ServiceLogRetention', resource_properties=retention)
+    log_identity = invoke(lambdaport, 'Create', **retention_args)
+    assert log_identity != 'stack/database-bootstrap'
+    state = {group['logGroupName']: group.get('retentionInDays') for group in logs.describe_log_groups()['logGroups']}
+    assert state == {groups[0]: 30, groups[1]: 30, 'unrelated': None}
+    assert logs.list_tags_log_group(logGroupName=groups[0])['tags'] == {'owner': 'existing'}
+    assert logs.get_log_events(logGroupName=groups[0], logStreamName='existing')['events'][0]['message'] == 'retained history'
+    retention.update(CreateLogGroups=groups, RetentionInDays='14')
+    assert invoke(lambdaport, 'Update', physical_id=log_identity, **retention_args) == log_identity
+    retention.update(CreateLogGroups=groups[:2], RetentionInDays='7')
+    invoke(lambdaport, 'Update', physical_id=log_identity, **retention_args)
+    invoke(lambdaport, 'Delete', physical_id=log_identity, **retention_args)
+    assert {group['logGroupName']: group.get('retentionInDays') for group in logs.describe_log_groups()['logGroups']} == {
+        **dict.fromkeys(groups, 7), 'unrelated': None}
+    assert 'JWT_KEYS' not in json.loads(sm.get_secret_value(SecretId=properties['ApiSecret'])['SecretString'])
+    print('PASS: service-log retention adopts existing groups, preserves history, handles disabled Insights and retains policies on deletion.', flush=True)
 
     invoke(badport, 'Create', expected='FAILED')
     assert 'JWT_KEYS' not in json.loads(sm.get_secret_value(SecretId=properties['ApiSecret'])['SecretString'])

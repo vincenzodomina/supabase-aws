@@ -140,6 +140,11 @@ Parameters:
       - 180
       - 365
     Default: 30
+  ServiceLogRetentionDays:
+    Type: Number
+    Description: Retention for RDS exports and Container Insights logs. Zero leaves policies unchanged. Shortening retention deletes history; see docs/Retention.md.
+    Default: 0
+    AllowedValues: [0, 1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653]
   ContainerInsights:
     Type: String
     Description: Optional paid ECS task telemetry; service metrics and application logs remain available when disabled.
@@ -278,6 +283,8 @@ Parameters:
     MinValue: 0
     Description: Alert below this measured free-memory floor in bytes. Zero omits the alarm for externally managed monitoring.
 Conditions:
+  ManageServiceLogRetention: !Not [!Equals [!Ref 'ServiceLogRetentionDays', 0]]
+  CollectContainerInsights: !Equals [!Ref 'ContainerInsights', enabled]
   MonitorDatabaseConnections: !Not [!Equals [!Ref 'DatabaseConnectionAlarmThreshold', 0]]
   MonitorDatabaseMemory: !Not [!Equals [!Ref 'DatabaseFreeableMemoryAlarmBytes', 0]]
   PublicApi: !Equals [!Ref 'ApiExposure', internet-facing]
@@ -1011,6 +1018,17 @@ Resources:
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
+              - !If
+                - ManageServiceLogRetention
+                - Effect: Allow
+                  Action:
+                    - logs:CreateLogGroup
+                    - logs:PutRetentionPolicy
+                  Resource:
+                    - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/rds/instance/${Database}/postgresql:*'
+                    - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/rds/instance/${Database}/upgrade:*'
+                    - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/ecs/containerinsights/${Cluster}/performance:*'
+                - !Ref 'AWS::NoValue'
               - Effect: Allow
                 Action:
                   - logs:CreateLogStream
@@ -1087,6 +1105,26 @@ Resources:
     DependsOn:
       - BootstrapDatabaseIngress
       - BootstrapDatabaseEgress
+  ServiceLogRetention:
+    Type: Custom::ServiceLogRetention
+    Condition: ManageServiceLogRetention
+    DependsOn: Bootstrap
+    Properties:
+      ServiceToken: !GetAtt 'BootstrapHandler.Arn'
+      ServiceTimeout: 960
+      Revision: !Ref 'BootstrapKey'
+      RetentionInDays: !Ref 'ServiceLogRetentionDays'
+      LogGroups:
+        - !Sub '/aws/rds/instance/${Database}/postgresql'
+        - !Sub '/aws/rds/instance/${Database}/upgrade'
+        - !Sub '/aws/ecs/containerinsights/${Cluster}/performance'
+      CreateLogGroups:
+        - !Sub '/aws/rds/instance/${Database}/postgresql'
+        - !Sub '/aws/rds/instance/${Database}/upgrade'
+        - !If
+          - CollectContainerInsights
+          - !Sub '/aws/ecs/containerinsights/${Cluster}/performance'
+          - !Ref 'AWS::NoValue'
   GatewayTask:
     Type: AWS::ECS::TaskDefinition
     Properties:
