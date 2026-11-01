@@ -46,7 +46,7 @@ Manual AWS acceptance is separate from the local/CI suite. Before production use
 
 From a host with private API access and the test dependencies installed, use `.venv/bin/python tests/acceptance.py --stack-name NAME --region REGION --profile PROFILE` for a Storage API round trip. It creates and deletes test data, requires access to the API secret, and leaves S3 version history subject to the bucket retention policy.
 
-Also complete the mode-specific [networking acceptance](Networking.md#capacity-and-rollout) and [workload sizing](Compute.md#rds-workload-sizing). Local tests do not establish RDS restrictions, managed networking, or compliance.
+Also complete [RDS privilege and migration acceptance](RDS%20Compatibility.md#manual-rds-acceptance), mode-specific [networking acceptance](Networking.md#capacity-and-rollout), and [workload sizing](Compute.md#rds-workload-sizing). Local tests do not establish RDS restrictions, managed networking, or compliance.
 
 ## Removal
 
