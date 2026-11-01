@@ -23,4 +23,4 @@ Describe boundaries and relevant privacy, compatibility, cost, or operational co
 
 **Related work**
 
-Reference existing issues and docs/ToDo.md item IDs (AWS-xx), or state that no item applies. Describe any remaining uncertainty.
+Reference related issues and PRs, or state that none apply. Describe any remaining uncertainty.
