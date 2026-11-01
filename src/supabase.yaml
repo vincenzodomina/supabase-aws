@@ -1,6 +1,22 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: Supabase on ECS Fargate with RDS PostgreSQL and S3; existing network and email delivery required.
 Parameters:
+  ExistingDatabaseSecretArn:
+    Type: String
+    Default: ''
+    Description: Existing same-account/region secret with username postgres and password; empty creates an administrator secret.
+  ExistingDatabaseSecretKmsKeyArn:
+    Type: String
+    Default: ''
+    Description: Optional customer-managed KMS key protecting ExistingDatabaseSecretArn.
+  LegacyApiKeysSecretArn:
+    Type: String
+    Default: ''
+    Description: Optional read-only secret with JWT_SECRET, ANON_KEY and SERVICE_ROLE_KEY for initial credential adoption.
+  LegacyApiKeysKmsKeyArn:
+    Type: String
+    Default: ''
+    Description: Optional customer-managed KMS key protecting LegacyApiKeysSecretArn.
   VpcId:
     Type: AWS::EC2::VPC::Id
     Description: Existing VPC with DNS support and hostnames enabled.
@@ -374,6 +390,11 @@ Parameters:
     MinValue: 0
     Description: Alert below this measured free-memory floor in bytes. Zero omits the alarm for externally managed monitoring.
 Conditions:
+  UseExistingDatabaseSecret: !Not [!Equals [!Ref ExistingDatabaseSecretArn, '']]
+  CreateDatabaseSecret: !Equals [!Ref ExistingDatabaseSecretArn, '']
+  HasDatabaseSecretKmsKey: !And [!Condition UseExistingDatabaseSecret, !Not [!Equals [!Ref ExistingDatabaseSecretKmsKeyArn, '']]]
+  HasLegacyApiKeys: !Not [!Equals [!Ref LegacyApiKeysSecretArn, '']]
+  HasLegacyApiKeysKmsKey: !And [!Condition HasLegacyApiKeys, !Not [!Equals [!Ref LegacyApiKeysKmsKeyArn, '']]]
   AdditionalPrivateApi: !And [!Condition PublicApi, !Equals [!Ref EnablePrivateApi, 'true']]
   HasPrivateApi: !Or [!Not [!Condition PublicApi], !Condition AdditionalPrivateApi]
   CreatePrivateApiDns: !And [!Condition AdditionalPrivateApi, !Not [!Equals [!Ref PrivateHostedZoneId, '']]]
@@ -802,6 +823,7 @@ Resources:
       CidrIp: 0.0.0.0/0
   DatabaseSecret:
     Type: AWS::SecretsManager::Secret
+    Condition: CreateDatabaseSecret
     Properties:
       GenerateSecretString:
         SecretStringTemplate: '{"username": "postgres"}'
@@ -883,7 +905,9 @@ Resources:
       EngineVersion: !Ref 'DatabaseEngineVersion'
       DBName: postgres
       MasterUsername: postgres
-      MasterUserPassword: !Sub '{{resolve:secretsmanager:${DatabaseSecret}:SecretString:password}}'
+      MasterUserPassword: !Sub
+        - '{{resolve:secretsmanager:${SecretArn}:SecretString:password}}'
+        - SecretArn: !If [UseExistingDatabaseSecret, !Ref ExistingDatabaseSecretArn, !Ref DatabaseSecret]
       DBInstanceClass: !Ref 'DatabaseInstanceClass'
       DBSubnetGroupName: !Ref 'DbSubnets'
       DBParameterGroupName: !Ref 'DbParameters'
@@ -1114,9 +1138,19 @@ Resources:
                 Action:
                   - secretsmanager:GetSecretValue
                 Resource:
-                  - !Ref 'DatabaseSecret'
+                  - !If [UseExistingDatabaseSecret, !Ref ExistingDatabaseSecretArn, !Ref DatabaseSecret]
                   - !Ref 'ApiSecret'
                   - !Ref 'MetaSecret'
+              - !If
+                - HasDatabaseSecretKmsKey
+                - Effect: Allow
+                  Action: kms:Decrypt
+                  Resource: !Ref ExistingDatabaseSecretKmsKeyArn
+                  Condition:
+                    StringEquals:
+                      kms:ViaService: !Sub 'secretsmanager.${AWS::Region}.${AWS::URLSuffix}'
+                      kms:EncryptionContext:SecretARN: !Ref ExistingDatabaseSecretArn
+                - !Ref AWS::NoValue
   StorageRole:
     Type: AWS::IAM::Role
     Properties:
@@ -1256,11 +1290,12 @@ Resources:
               - Effect: Allow
                 Action: secretsmanager:GetSecretValue
                 Resource:
-                  - !Ref 'DatabaseSecret'
+                  - !If [UseExistingDatabaseSecret, !Ref ExistingDatabaseSecretArn, !Ref DatabaseSecret]
                   - !Ref 'AuthSecret'
                   - !Ref 'RestSecret'
                   - !Ref 'StorageSecret'
                   - !Ref 'ApiSecret'
+                  - !If [HasLegacyApiKeys, !Ref LegacyApiKeysSecretArn, !Ref AWS::NoValue]
               - Effect: Allow
                 Action: secretsmanager:PutSecretValue
                 Resource:
@@ -1268,6 +1303,26 @@ Resources:
                   - !Ref 'RestSecret'
                   - !Ref 'StorageSecret'
                   - !Ref 'ApiSecret'
+              - !If
+                - HasDatabaseSecretKmsKey
+                - Effect: Allow
+                  Action: kms:Decrypt
+                  Resource: !Ref ExistingDatabaseSecretKmsKeyArn
+                  Condition:
+                    StringEquals:
+                      kms:ViaService: !Sub 'secretsmanager.${AWS::Region}.${AWS::URLSuffix}'
+                      kms:EncryptionContext:SecretARN: !Ref ExistingDatabaseSecretArn
+                - !Ref AWS::NoValue
+              - !If
+                - HasLegacyApiKeysKmsKey
+                - Effect: Allow
+                  Action: kms:Decrypt
+                  Resource: !Ref LegacyApiKeysKmsKeyArn
+                  Condition:
+                    StringEquals:
+                      kms:ViaService: !Sub 'secretsmanager.${AWS::Region}.${AWS::URLSuffix}'
+                      kms:EncryptionContext:SecretARN: !Ref LegacyApiKeysSecretArn
+                - !Ref AWS::NoValue
   BootstrapHandler:
     Type: AWS::Lambda::Function
     Properties:
@@ -1304,11 +1359,12 @@ Resources:
       Revision: !Ref 'BootstrapKey'
       DatabaseHost: !GetAtt 'Database.Endpoint.Address'
       DatabasePort: !GetAtt 'Database.Endpoint.Port'
-      DatabaseSecret: !Ref 'DatabaseSecret'
+      DatabaseSecret: !If [UseExistingDatabaseSecret, !Ref ExistingDatabaseSecretArn, !Ref DatabaseSecret]
       AuthSecret: !Ref 'AuthSecret'
       RestSecret: !Ref 'RestSecret'
       StorageSecret: !Ref 'StorageSecret'
       ApiSecret: !Ref 'ApiSecret'
+      LegacyApiKeysSecret: !If [HasLegacyApiKeys, !Ref LegacyApiKeysSecretArn, !Ref 'AWS::NoValue']
     DependsOn:
       - EncryptionCheck
       - BootstrapDatabaseIngress
@@ -3167,7 +3223,9 @@ Resources:
               Value: --max-old-space-size=600
           Secrets:
             - Name: PG_META_DB_PASSWORD
-              ValueFrom: !Sub '${DatabaseSecret}:password::'
+              ValueFrom: !Sub
+                - '${SecretArn}:password::'
+                - SecretArn: !If [UseExistingDatabaseSecret, !Ref ExistingDatabaseSecretArn, !Ref DatabaseSecret]
             - Name: CRYPTO_KEY
               ValueFrom: !Sub '${MetaSecret}:crypto_key::'
           MountPoints:
@@ -3230,7 +3288,9 @@ Resources:
               Value: 'false'
           Secrets:
             - Name: POSTGRES_PASSWORD
-              ValueFrom: !Sub '${DatabaseSecret}:password::'
+              ValueFrom: !Sub
+                - '${SecretArn}:password::'
+                - SecretArn: !If [UseExistingDatabaseSecret, !Ref ExistingDatabaseSecretArn, !Ref DatabaseSecret]
             - Name: PG_META_CRYPTO_KEY
               ValueFrom: !Sub '${MetaSecret}:crypto_key::'
             - Name: AUTH_JWT_SECRET
@@ -3498,7 +3558,7 @@ Outputs:
   DatabaseSecurityGroupId:
     Value: !Ref 'DatabaseSG'
   DatabaseSecretArn:
-    Value: !Ref 'DatabaseSecret'
+    Value: !If [UseExistingDatabaseSecret, !Ref ExistingDatabaseSecretArn, !Ref DatabaseSecret]
   ApiSecretArn:
     Value: !Ref 'ApiSecret'
   StorageBucketName:

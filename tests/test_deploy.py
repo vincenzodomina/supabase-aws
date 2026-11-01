@@ -434,6 +434,39 @@ class ArtifactTest(unittest.TestCase):
                 self.assertEqual(resources[name]['Properties'][field], {'Fn::If': ['UseServiceConnectTls', 'HTTPS', 'HTTP']})
             self.assertEqual(resources[name]['Properties']['HealthCheckPort'], 'traffic-port')
 
+    def test_existing_credentials_are_optional_and_source_permissions_are_read_only(self):
+        document, errors = decode_str(subprocess.check_output([str(ROOT/'src/deploy.sh'), '--template'], text=True))
+        self.assertFalse(errors)
+        for supplied in [False, True]:
+            overrides = {'EnableStudio': 'true'}
+            if supplied:
+                overrides.update(ExistingDatabaseSecretArn='arn:aws:secretsmanager:us-east-1:123456789012:secret:db',
+                    ExistingDatabaseSecretKmsKeyArn='arn:aws:kms:us-east-1:123456789012:key/db',
+                    LegacyApiKeysSecretArn='arn:aws:secretsmanager:us-east-1:123456789012:secret:legacy',
+                    LegacyApiKeysKmsKeyArn='arn:aws:kms:us-east-1:123456789012:key/legacy')
+            resources = configured(document, overrides)
+            self.assertEqual('DatabaseSecret' in resources, not supplied)
+            expected = overrides.get('ExistingDatabaseSecretArn', {'Ref': 'DatabaseSecret'})
+            self.assertEqual(resources['Bootstrap']['Properties']['DatabaseSecret'], expected)
+            self.assertEqual(resources['Database']['Properties']['MasterUserPassword']['Fn::Sub'][1]['SecretArn'], expected)
+            self.assertEqual(resources['Database']['Properties']['MasterUsername'], 'postgres')
+            for container in resources['AdminTask']['Properties']['ContainerDefinitions']:
+                for secret in container.get('Secrets', []):
+                    if secret['Name'] in ['PG_META_DB_PASSWORD', 'POSTGRES_PASSWORD']:
+                        self.assertEqual(secret['ValueFrom']['Fn::Sub'][1]['SecretArn'], expected)
+            for role in ['BootstrapRole', 'AdminExecutionRole']:
+                statements = resources[role]['Properties']['Policies'][0]['PolicyDocument']['Statement']
+                decrypt = [entry for entry in statements if entry['Action'] == 'kms:Decrypt']
+                self.assertEqual(len(decrypt), (2 if role == 'BootstrapRole' else 1) if supplied else 0)
+                if supplied:
+                    for statement in statements:
+                        if 'secretsmanager:PutSecretValue' in statement['Action']:
+                            self.assertNotIn(overrides['ExistingDatabaseSecretArn'], statement['Resource'])
+                            self.assertNotIn(overrides['LegacyApiKeysSecretArn'], statement['Resource'])
+                    for statement in decrypt:
+                        self.assertIn(statement['Condition']['StringEquals']['kms:EncryptionContext:SecretARN'],
+                            [overrides['ExistingDatabaseSecretArn'], overrides['LegacyApiKeysSecretArn']])
+
     def test_credential_refresh_reapplies_bootstrap_before_replacing_tasks(self):
         template, errors = decode_str(subprocess.check_output([str(ROOT/'src/deploy.sh'), '--template'], text=True, timeout=10))
         self.assertFalse(errors)
@@ -465,7 +498,7 @@ class ArtifactTest(unittest.TestCase):
                 if 'Ref' in value or 'Fn::GetAtt' in value:
                     return 'x'*1024
                 if 'Fn::Sub' in value:
-                    return re.sub(r'\$\{[^}]+\}', 'x'*1024, value['Fn::Sub'])
+                    return re.sub(r'\$\{[^}]+\}', 'x'*1024, value['Fn::Sub'][0] if isinstance(value['Fn::Sub'], list) else value['Fn::Sub'])
                 return {key: sized(item) for key, item in value.items()}
             return value
 

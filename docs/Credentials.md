@@ -1,8 +1,23 @@
-# Credential rotation
+# Credentials
 
 `CredentialRevision` is a non-secret change identifier. Changing it reruns the existing bootstrap, then rolls every enabled ECS service in dependency order. Bootstrap applies the three service-role passwords and rebuilds their connection URIs; it preserves a complete API key bundle. The revision does not generate new passwords, reset the RDS master password, or revoke user sessions.
 
 [ECS reads injected secrets at task launch](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/secrets-envvar-secrets-manager.html). The stack uses the native [deployment nonce](https://docs.aws.amazon.com/AWSCloudFormation/latest/TemplateReference/aws-properties-ecs-service-forcenewdeployment.html) to replace tasks without changing images. [Changing a secret alone does not update an RDS dynamic reference](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/dynamic-references-secretsmanager.html).
+
+## Reuse existing credentials
+
+All inputs are optional; empty values keep stack-generated credentials.
+
+| Input | Required secret JSON | Ownership |
+| --- | --- | --- |
+| `ExistingDatabaseSecretArn` | `{"username":"postgres","password":"…"}` | Read-only external administrator secret; the stack creates no replacement secret. |
+| `LegacyApiKeysSecretArn` | `{"JWT_SECRET":"…","ANON_KEY":"…","SERVICE_ROLE_KEY":"…"}` | Read-only source copied into the stack-owned API bundle during initialization. |
+
+Use secrets in the stack's account and region. Set `ExistingDatabaseSecretKmsKeyArn` or `LegacyApiKeysKmsKeyArn` when the corresponding secret uses a customer-managed key. Key policies must permit the narrowly scoped roles; the CloudFormation execution identity also needs access to the database secret/key for its dynamic reference.
+
+Legacy import requires a JWT secret of at least 32 characters and unexpired HS256 keys with valid signatures and matching `anon`/`service_role` roles. Bootstrap validates these before database writes, preserves the exact legacy values, and generates the asymmetric and opaque keys once. Repeated runs preserve the complete bundle and never write to either source secret. A changed source cannot overwrite an initialized bundle. After acceptance, remove `LegacyApiKeysSecretArn` and its KMS input to remove ongoing source access; this preserves imported credentials and permits later signing-key rotation.
+
+These inputs reuse credentials, not RDS instances or buckets. Follow [adoption guidance](Deployment.md#adopting-an-existing-installation) when adapting existing infrastructure. Before changing an established database secret reference, verify it matches the actual `postgres` password and coordinate all consumers. Keep the selected reference stable: reverting to an empty input creates a new password source. External secret rotation remains the owner's responsibility and must coordinate RDS, bootstrap, and optional Studio/meta; changing a secret or `CredentialRevision` alone cannot reset the RDS password.
 
 ## Prepare and review
 
@@ -26,6 +41,8 @@ resource() {
     --logical-resource-id "$1" --query StackResourceDetail.PhysicalResourceId --output text
 }
 db=$(resource Database)
+master_secret=$(aws cloudformation describe-stacks --stack-name "$stack" \
+  --query "Stacks[0].Outputs[?OutputKey=='DatabaseSecretArn'].OutputValue | [0]" --output text)
 aws rds describe-db-instances --db-instance-identifier "$db" > "$rotation_dir/database.json"
 jq --arg revision "$(date -u +%Y%m%dT%H%M%SZ)" '.CredentialRevision=$revision' \
   "$parameters" > "$rotation_dir/parameters.json"
@@ -38,7 +55,7 @@ Select one secret below, then save its current complete JSON object:
 
 | Rotation | Set `secret` to | Result |
 | --- | --- | --- |
-| RDS master | `$(resource DatabaseSecret)` | Update RDS first, then the secret; bootstrap and optional Studio/meta need the new password. |
+| RDS master | `$master_secret` | Update RDS first, then the secret; bootstrap and optional Studio/meta need the new password. |
 | Service role | `$(resource AuthSecret)`, `$(resource RestSecret)`, or `$(resource StorageSecret)` | Publish the new password; bootstrap applies it and repairs the URI before tasks roll. |
 | SES SMTP | Existing `SesSmtpSecretArn` | Publish credentials for the configured SES region; refresh tasks, then retire the old SMTP credentials. |
 | API keys/signing | `$(resource ApiSecret)` | Choose opaque keys only or a deliberate complete signing-bundle cutover. |
@@ -90,7 +107,7 @@ print('New database credential accepted with verified TLS.')
 PY
 ```
 
-Keep RDS and `DatabaseSecret` synchronized for future stack updates. Do not enable independent automatic rotation without coordinating these consumers and the bootstrap connection.
+Keep RDS and the selected administrator secret synchronized for future stack updates. Do not enable independent automatic rotation without coordinating these consumers and the bootstrap connection.
 
 ## SES SMTP
 
