@@ -243,6 +243,8 @@ class ArtifactTest(unittest.TestCase):
         self.assertNotIn(b'@include', rendered)
         template, errors = decode_str(rendered.decode())
         self.assertFalse(errors)
+        self.assertEqual(template['Parameters']['EcsCpuArchitecture']['Default'], 'X86_64')
+        self.assertEqual(template['Parameters']['EcsCpuArchitecture']['AllowedValues'], ['X86_64', 'ARM64'])
 
         def sized(value):
             # Estimate resolved names/ARNs with 1 KiB per substitution, plus 4 KiB task headroom.
@@ -261,6 +263,7 @@ class ArtifactTest(unittest.TestCase):
                 continue
             task = resource['Properties']
             with self.subTest(task=name):
+                self.assertEqual(task['RuntimePlatform']['CpuArchitecture'], {'Ref': 'EcsCpuArchitecture'})
                 self.assertLess(len(json.dumps(sized(task)).encode()), 60*1024)
                 for container in task['ContainerDefinitions']:
                     self.assertRegex(container['Image'], r'^[^@]+:[^:@]+@sha256:[a-f0-9]{64}$')
