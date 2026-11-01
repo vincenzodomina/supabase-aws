@@ -4,7 +4,7 @@
 # ┃                     Supabase Deployment Script                     ┃
 # ┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫
 # ┃  One CloudFormation stack; no custom container builds.             ┃
-# ┃  Default: create a change set. Use --apply to execute.              ┃
+# ┃  Deploy current inputs; unchanged stacks succeed without updates.  ┃
 # ┃                                                                    ┃
 # ┃  1. Parse Options and Check Required Tools                          ┃
 # ┃  2. Load Parameters and Embed the Gateway Script                    ┃
@@ -22,7 +22,7 @@ set -euo pipefail
 project_dir=$(cd "$(dirname "$0")/.." && pwd)
 
 usage() {
-  echo "Usage: $0 --stack-name NAME --region REGION --parameters FILE --artifacts-bucket BUCKET [--profile PROFILE] [--role-arn ARN] [--apply]"
+  echo "Usage: $0 --stack-name NAME --region REGION --parameters FILE --artifacts-bucket BUCKET [--profile PROFILE] [--role-arn ARN]"
   echo "       $0 --template > rendered.yaml"
   echo "       $0 --package bootstrap.zip"
 }
@@ -73,7 +73,6 @@ if [[ $# -eq 2 && "$1" == --package ]]; then
   exit 0
 fi
 
-apply=false
 stack_name='' region='' parameters='' artifacts_bucket='' role_arn=''
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -83,7 +82,6 @@ while [[ $# -gt 0 ]]; do
     --artifacts-bucket) artifacts_bucket="${2:?Missing artifact bucket}"; shift 2 ;;
     --profile) export AWS_PROFILE="${2:?Missing profile}"; shift 2 ;;
     --role-arn) role_arn="${2:?Missing CloudFormation role ARN}"; shift 2 ;;
-    --apply) apply=true; shift ;;
     --help|-h) usage; exit 0 ;;
     *) usage >&2; exit 1 ;;
   esac
@@ -155,17 +153,14 @@ protect_database() {
 }
 new_stack=false
 if [[ "$status" == NEW || "$status" == REVIEW_IN_PROGRESS ]]; then new_stack=true; fi
-if "$apply" && ! "$new_stack"; then protect_database; fi
+if ! "$new_stack"; then protect_database; fi
 
 ########## 6. Deploy the Stack and Protect a Newly Created Database ##########
 
 options=(--no-fail-on-empty-changeset)
 if [[ -n "$role_arn" ]]; then options+=(--role-arn "$role_arn"); fi
-if ! "$apply"; then options+=(--no-execute-changeset); fi
 aws cloudformation deploy --stack-name "$stack_name" --template-file "$scratch/supabase.yaml" \
   --s3-bucket "$artifacts_bucket" --s3-prefix "supabase-aws/$stack_name" \
   --capabilities CAPABILITY_IAM --parameter-overrides "${overrides[@]}" "${options[@]}"
-if "$apply"; then
-  if "$new_stack"; then protect_database; fi
-  echo 'Stack deployment complete. Run the README acceptance checks before serving users.'
-fi
+if "$new_stack"; then protect_database; fi
+echo 'Stack deployment complete. Run the README acceptance checks before serving users.'

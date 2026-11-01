@@ -64,15 +64,17 @@ Copy `src/parameters.example.json` to the ignored `src/parameters.json` and supp
   --parameters src/parameters.json --artifacts-bucket YOUR_EXISTING_ARTIFACT_BUCKET
 ```
 
-Without `--apply`, this packages and uploads the Lambda ZIP, CA bundle, and template, then creates a reviewable CloudFormation change set without executing it. Both a first installation and an update use **one stack deployment**.
+**This command deploys immediately.** Review the source and parameters before running it. The script packages and uploads the Lambda ZIP, CA bundle, and template, then AWS CloudFormation creates and executes a change set. Rerun the same command for updates; an unchanged stack succeeds without an infrastructure update. Both a first installation and an update use **one stack deployment**.
+
+The former preview default and `--apply` flag are removed. Update existing callers by removing `--apply`; an old invocation without that flag now deploys. Offline `--template` rendering remains available for source inspection and consuming pipelines, but it does not calculate AWS resource changes. Use the consuming pipeline's native CloudFormation approval flow when a saved change set must be reviewed before execution.
 
 Optionally pass `--role-arn ARN` to use an existing CloudFormation execution role that trusts `cloudformation.amazonaws.com` and has permission to manage the stack resources and read its artifacts. The caller needs `iam:PassRole` for that role, plus artifact-upload and CloudFormation permissions, including stack-policy access. [CloudFormation keeps the role associated with the stack](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/using-iam-servicerole.html) for later operations even when this flag is omitted; scope both role and stack access carefully.
 
-Run the same command with `--apply` to deploy. CloudFormation provisions RDS, invokes the bootstrap Lambda, and starts ECS services only after initialization succeeds. The Lambda connects to RDS with verified TLS, initializes database prerequisites, and populates service credentials. Updates rerun bootstrap when its packaged source changes, preserving existing signing keys; deletion never alters the database.
+CloudFormation provisions RDS, invokes the bootstrap Lambda, and starts ECS services only after initialization succeeds. The Lambda connects to RDS with verified TLS, initializes database prerequisites, and populates service credentials. Updates rerun bootstrap when its packaged source changes, preserving existing signing keys; deletion never alters the database.
 
 The Bash deployer uploads artifacts under content-addressed S3 keys and passes `ArtifactsBucket`, `BootstrapKey`, and `CertificateKey` to the template. Keep those parameters out of your parameter file. `./src/deploy.sh --package /tmp/bootstrap.zip` produces the Lambda package without AWS credentials; Python, SQL, dependencies, and the CA bundle remain separate files under `src/`. Other pipelines can package/upload these artifacts and deploy the same template.
 
-The deployer installs a CloudFormation stack policy blocking database replacement/removal, preserving existing restrictions. It applies the policy before updates and immediately after successful first creation. Stack policies are an API setting, not a template resource; database deletion protection and snapshot policies are declared in the YAML. `--apply` creates and executes a fresh change set from the current files. Review changes before applying; an ECS rollback does not reverse database migrations.
+The deployer installs a CloudFormation stack policy blocking database replacement/removal, preserving existing restrictions. It applies the policy before updates and immediately after successful first creation. Stack policies are an API setting, not a template resource; database deletion protection and snapshot policies are declared in the YAML. Each deployment creates and executes a fresh change set from the current files. Review changes before deployment; an ECS rollback does not reverse database migrations.
 
 Envoy uses its pinned official image. `src/deploy.sh` embeds `src/gateway-entrypoint.sh` into the template before upload; the `@include` marker is local packaging syntax, not a CloudFormation feature. Use `./src/deploy.sh --template > rendered.yaml` to produce the deployable template for review or another pipeline (with its S3 artifact parameters), without AWS credentials. Gateway configuration lives in `src/supabase.yaml`, and secrets are injected by ECS at task launch.
 
@@ -80,7 +82,7 @@ The API defaults to `ApiExposure=internal`, using the private application subnet
 
 If `HostedZoneId` is supplied, the stack creates the API alias in that existing zone: use a private zone associated with the VPC for internal access, or a public zone for internet-facing access. Otherwise manage the corresponding DNS yourself, pointing `ApiDomainName` at `ApiLoadBalancerDnsName`. DNS must match the supplied certificate. The API is HTTPS-only.
 
-Existing public deployments must explicitly set `ApiExposure=internet-facing` to preserve their exposure. Changing the scheme replaces the ALB and updates its DNS target; review the change set and plan a client/DNS cutover before switching an existing deployment.
+Existing public deployments must explicitly set `ApiExposure=internet-facing` to preserve their exposure. Changing the scheme replaces the ALB and updates its DNS target; review the ALB replacement and plan a client/DNS cutover before switching an existing deployment.
 
 `ApiSecretArn` identifies the generated API credentials. Retrieve only `SUPABASE_PUBLISHABLE_KEY` for clients; keep `SUPABASE_SECRET_KEY`, legacy service-role keys, and signing keys on trusted servers. The stack never returns secret values through outputs.
 

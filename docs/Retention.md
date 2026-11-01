@@ -1,6 +1,6 @@
 # Retention
 
-Choose retention under the organization's audit, recovery, and deletion policy. Shortening a period can permanently remove existing history; a CloudFormation rollback cannot recover expired data. Review a change set before applying a retention change.
+Choose retention under the organization's audit, recovery, and deletion policy. Shortening a period can permanently remove existing history; a CloudFormation rollback cannot recover expired data. Review the selected retention period and affected history before deploying a retention change.
 
 ## Service logs
 
