@@ -784,7 +784,7 @@ Resources:
   DbParameters:
     Type: AWS::RDS::DBParameterGroup
     Properties:
-      Description: Supabase PostgreSQL 17 TLS and query statistics settings
+      Description: Supabase PostgreSQL 17 TLS policy
       Family: postgres17
       Parameters:
         rds.force_ssl: '1'
