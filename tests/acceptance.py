@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create a temporary private bucket, exercise S3-backed Storage, then remove test data."""
+"""Exercise private Storage and API deletion; S3 history follows the bucket retention policy."""
 import argparse
 import json
 import secrets
