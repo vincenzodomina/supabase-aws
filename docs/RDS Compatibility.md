@@ -49,7 +49,15 @@ Realtime/replication, ETL, analytics, pooler, and webhook supporting schemas, ro
 
 ## Upstream updates and verification
 
-- Compare the new upstream release with the pinned sources, including service migrations and changes outside this inventory. Record each relevant addition, adaptation, or exclusion here with its source, rationale, and local SQL location; update `NOTICE` when attribution changes.
+Start an upgrade review from the pinned references above and the image versions in [supabase.yaml](../src/supabase.yaml). Record the old and proposed tags and resolved commit/image digests in the upgrade PR. Compare complete source trees, including added, removed, and renamed files; this inventory is a map of selected behavior, not a filter for discovering changes.
+
+| Compare between releases | Review outcome |
+| --- | --- |
+| Supabase Postgres `migrations/db/init-scripts` and `migrations/db/migrations` | Classify relevant role, ownership, privilege, extension, helper, and event-trigger changes as retained, adapted for RDS, or excluded with a scope/restriction reason. Review changed defaults as well as new SQL. |
+| Supabase `docker/docker-compose.yml`, `docker/volumes/db`, and `docker/CHANGELOG.md` | Identify prerequisites supplied outside the Postgres migration tree, changed service configuration, coordinated image versions, and irreversible upgrade steps. |
+| Auth and Storage migration sources at the old and proposed image releases | Confirm their unmodified migrations still work with the bootstrap's roles, schema ownership, extensions, and `DB_INSTALL_ROLES=false`. Identify prerequisites that must be applied before the new service starts. |
+
+- Update the relevant inventory rows with pinned upstream links, rationale, and local SQL locations; update `NOTICE` when attribution changes. Record unresolved compatibility questions in the upgrade issue rather than silently treating them as exclusions.
 - Append forward migrations for database changes. Do not edit, rename, delete, or insert before already-applied files. Checksums detect changes to local migration history; they do not detect missed upstream requirements. Existing databases need forward changes, not only an updated fresh-install baseline.
 - Run the existing [Docker/Moto integration suite](../CONTRIBUTION.md#validation). It covers failed-transaction recovery, incompatible baseline rejection, immutable history, retries after service migrations, inherited permissions, and live PostgREST schema-cache refresh.
 - Verify fresh installation and upgrade on an approved disposable RDS instance, especially `BYPASSRLS`, role administration, logging settings, event-trigger privileges, extension availability, service migrations, and optional Studio access. Ordinary PostgreSQL and Moto do not reproduce RDS's privilege model.
