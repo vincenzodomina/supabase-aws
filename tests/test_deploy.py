@@ -310,7 +310,7 @@ class ArtifactTest(unittest.TestCase):
                          {'Fn::If': [public_condition, {'Ref': 'PublicSubnetIds'}, {'Ref': 'PrivateSubnetIds'}]})
         private = resources['PrivateApiHttps']
         self.assertEqual(template['Conditions'][private['Condition']], {'Fn::And': [
-            {'Fn::Equals': [{'Ref': 'ApiExposure'}, 'internal']},
+            {'Condition': 'HasPrivateApi'},
             {'Fn::Equals': [{'Ref': 'ManageApiIngress'}, 'true']}]})
         self.assertEqual(private['Properties']['SourceSecurityGroupId'], {'Ref': 'ApiClientSecurityGroupId'})
         self.assertNotIn('CidrIp', private['Properties'])
@@ -318,9 +318,11 @@ class ArtifactTest(unittest.TestCase):
         self.assertNotIn('SecurityGroupIngress', resources['ApiAlbSG']['Properties'])
         api_ingress = {name for name, resource in resources.items() if resource['Type'] == 'AWS::EC2::SecurityGroupIngress'
                        and resource['Properties']['GroupId'] == {'Ref': 'ApiAlbSG'}}
-        self.assertEqual(api_ingress, {'PublicHttps', 'PrivateApiHttps'})
+        self.assertEqual(api_ingress, {'PublicHttps'})
         rule = template['Rules']['PrivateApiRequiresClients']
-        self.assertEqual(rule['RuleCondition'], template['Conditions'][private['Condition']])
+        self.assertEqual(rule['RuleCondition']['Fn::And'][0], {'Fn::Or': [
+            {'Fn::Equals': [{'Ref': 'ApiExposure'}, 'internal']},
+            {'Fn::Equals': [{'Ref': 'EnablePrivateApi'}, 'true']}]})
         self.assertEqual(rule['Assertions'][0]['Assert'], {'Fn::Not': [{'Fn::Equals': [{'Ref': 'ApiClientSecurityGroupId'}, '']}]})
         public_rule = template['Rules']['PublicApiRequiresSubnets']
         self.assertEqual(public_rule['RuleCondition'], template['Conditions'][public_condition])
@@ -333,6 +335,35 @@ class ArtifactTest(unittest.TestCase):
         self.assertEqual(outputs['ServiceConnectNamespaceArn'],
                          {'Value': {'Fn::GetAtt': ['TlsNamespace', 'Arn']}, 'Condition': 'UseServiceConnectTls'})
         self.assertFalse(any('Export' in output for output in outputs.values()))
+
+    def test_optional_private_api_preserves_single_endpoint_defaults(self):
+        document, errors = decode_str(subprocess.check_output([str(ROOT/'src/deploy.sh'), '--template'], text=True))
+        self.assertFalse(errors)
+        for exposure, additional in [('internal', 'false'), ('internet-facing', 'false'), ('internet-facing', 'true')]:
+            for encryption in ['vpc', 'service-connect-tls']:
+                for managed in ['true', 'false']:
+                    resources = configured(document, {'ApiExposure': exposure, 'EnablePrivateApi': additional,
+                        'InternalTrafficEncryption': encryption, 'ManageApiIngress': managed,
+                        'ApiClientSecurityGroupId': 'sg-client', 'PrivateHostedZoneId': 'private-zone' if additional == 'true' else ''})
+                    dual = additional == 'true'
+                    self.assertEqual('PrivateApiAlb' in resources, dual)
+                    self.assertEqual('PrivateApiDns' in resources, dual)
+                    self.assertEqual('PrivateApiErrorsAlarm' in resources, dual)
+                    self.assertEqual('PublicHttps' in resources, exposure == 'internet-facing')
+                    self.assertEqual('PrivateApiHttps' in resources, managed == 'true' and (dual or exposure == 'internal'))
+                    gateway = resources['GatewayService']['Properties']
+                    self.assertEqual(len(gateway['LoadBalancers']), 2 if dual else 1)
+                    if dual:
+                        self.assertIn({'Key': 'PrivateApiListener', 'Value': {'Ref': 'PrivateApiListener'}}, gateway['Tags'])
+                        self.assertEqual(resources['PrivateApiAlb']['Properties']['Scheme'], 'internal')
+                        self.assertEqual(resources['PrivateApiListener']['Properties']['Port'], 443)
+                        self.assertEqual(resources['PrivateGatewayTargets']['Properties']['Protocol'], 'HTTPS' if encryption == 'service-connect-tls' else 'HTTP')
+                        if managed == 'true':
+                            ingress = resources['PrivateApiHttps']['Properties']
+                            self.assertEqual(ingress['GroupId'], {'Ref': 'PrivateApiAlbSG'})
+                            self.assertEqual(ingress['SourceSecurityGroupId'], 'sg-client')
+                            self.assertNotIn('CidrIp', ingress)
+        self.assertNotIn('PrivateApiListener', document['Resources']['GatewayService']['DependsOn'])
 
     def test_auth_delivery_modes_keep_secrets_and_permissions_separate(self):
         document, errors = decode_str(subprocess.check_output([str(ROOT/'src/deploy.sh'), '--template'], text=True))
