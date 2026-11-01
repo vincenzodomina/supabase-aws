@@ -33,6 +33,15 @@ This community-maintained project addresses those two core needs: RDS compatibil
 | US-09 | As a maintainer, I want to copy a versioned release of the project's source into a consuming infrastructure repository, so that the organization can review, maintain, and deploy it independently. |
 | US-10 | As an operator, I want to review proposed infrastructure changes and receive clear deployment success or failure, so that changes remain controlled and auditable. |
 
+## Enterprise flexibility (design preference)
+
+Apply these goals selectively where they improve enterprise integration without disproportionate parameters, code, or maintenance effort. They guide future design rather than require universal configurability or a creation/reuse option for every resource. Required security protections and existing shared-infrastructure prerequisites remain in force.
+
+| ID | User story |
+| --- | --- |
+| US-39 | As a platform owner, I want advanced enterprise features with significant security or cost implications to be configurable where useful, so that I can match the deployment to our governance, protection, and budget needs. |
+| US-40 | As an infrastructure engineer, I want to reference resources shared across a product's infrastructure and, where appropriate to the stack's scope, have them created when those inputs are omitted, so that I can avoid duplication and unnecessary provisioning work. |
+
 ## Supabase capabilities and application access
 
 | ID | User story |
@@ -41,6 +50,7 @@ This community-maintained project addresses those two core needs: RDS compatibil
 | US-12 | As an application developer, I want a ready-to-use Supabase URL and anon key, with support for upstream-recommended client credentials, so that I can use standard Supabase clients for the supported capabilities. |
 | US-13 | As an application team, I want to deploy our own ECS application alongside Supabase in the same VPC and connect privately, so that backend-to-backend traffic stays within our company network. |
 | US-14 | As an operator, I want the stack to establish the private communication its Supabase services need and maintain it through scaling and replacement, so that the services continue working together. |
+| US-38 | As a security owner, I want to choose between enforced encryption supplied by our enterprise VPC and TLS between service tasks, so that internal communication is protected using the approach that fits our infrastructure. |
 | US-15 | As a security owner, I want private-only access to be supported and any client-facing exposure to be an explicit choice, so that the deployment follows our network access policy. |
 | US-16 | As an administrator, I want to enable or disable Studio and its metadata administration capability together, with access restricted to approved private users, so that administration is available only where needed. |
 

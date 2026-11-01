@@ -34,6 +34,7 @@ flowchart TD
 
 - An AWS account and permission to deploy CloudFormation, IAM, ECS, RDS, S3, Cloud Map, Lambda, CloudWatch, and load balancers.
 - An existing VPC with DNS support/hostnames enabled, two private application subnets, and private database subnets spanning at least two Availability Zones. Application and database subnets may overlap. The default internal API requires an existing client security group in this VPC. Internet-facing access additionally requires two public subnets.
+- Internal encryption: an existing VPC in encryption-enforcement mode (default), or `InternalTrafficEncryption=service-connect-tls` with an existing AWS Private CA. See [networking prerequisites, capacity, and rollout](docs/Networking.md).
 - Shared outbound connectivity from application subnets as listed below. The stack does not create NAT gateways or VPC endpoints.
 - An existing ACM certificate in the deployment region covering the API hostname and, if enabled, the Studio hostname.
 - An existing private S3 bucket in the deployment region for templates, Lambda ZIPs, and the RDS CA bundle. The deployer needs `s3:PutObject`/`s3:GetObject`; certificate readers receive access to only their CA object. Uploads use SSE-S3 encryption. Retain artifacts while referenced by current or rollback deployments; task replacements still download the CA bundle.
@@ -45,6 +46,7 @@ flowchart TD
 | --- | --- | --- |
 | ECS image pulls → Docker Hub and `public.ecr.aws` | TCP 443 | Public registry, authentication, and layer-download hosts need [outbound routing](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/networking-outbound.html). Private ECR endpoints do not provide access to these registries. |
 | ECS secret injection and bootstrap → Secrets Manager | TCP 443 | Reach the region containing each secret; an interface endpoint needs private DNS and a policy permitting `GetSecretValue`, plus bootstrap's `PutSecretValue` on generated service secrets. |
+| Network prerequisite check → EC2 API | TCP 443 | VPC encryption mode requires regional `DescribeVpcEncryptionControls` access through existing egress or an interface endpoint; see [Networking](docs/Networking.md). |
 | ECS logging → CloudWatch Logs | TCP 443 | Regional Logs endpoint or shared egress; permit execution-role `CreateLogStream` and `PutLogEvents` on the stack log group. |
 | Storage and certificate helpers → S3 | TCP 443 | Permit the Storage role's bucket/object and multipart actions on the stack bucket, and task-role `GetObject` on the artifact bucket's CA object. |
 | Bootstrap → CloudFormation's presigned S3 response URL | TCP 443 | S3 endpoint policies must permit the callback's signed `PutObject` to `cloudformation-custom-resource-response-<region-without-dashes>/*`. Do not restrict this solely to project buckets or the Lambda role. A CloudFormation API endpoint alone is insufficient. [AWS callback requirements](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/vpc-interface-endpoints.html). |
@@ -111,7 +113,7 @@ Fresh deployments with Studio disabled create no administration resources. Disab
 | Logs | ECS CloudWatch logging, 30-day retention; gateway omits request URLs/tokens |
 | Task telemetry | Container Insights enabled; set `ContainerInsights=disabled` to omit paid task metrics while retaining service metrics, CPU scaling, and application logs |
 
-Cloud Map avoids a proxy sidecar per application service; clients must handle task replacement and DNS refresh. PostgREST needs a readiness sidecar because its image does not include a shell/HTTP client. Certificate initialization uses the official AWS CLI image to copy the versioned CA bundle into a shared task volume; the probe uses the official Python image. All images are pinned by digest. There are no custom container builds or stack-owned ECR repositories.
+VPC encryption mode uses Cloud Map DNS; clients must handle task replacement and DNS refresh. Service Connect TLS adds AWS-managed proxies and certificate rotation, with additional task capacity and shared-CA prerequisites. PostgREST needs a readiness sidecar because its image does not include a shell/HTTP client. Certificate initialization uses the official AWS CLI image to copy the versioned CA bundle into a shared task volume; the probe uses the official Python image. All images are pinned by digest. There are no custom container builds or stack-owned ECR repositories.
 
 This is a deliberately limited RDS integration, not parity with the managed Supabase platform or its custom Postgres distribution. It initializes the roles, schemas, JWT helper functions, and extensions required by the selected services. Auth and Storage apply their own release-specific schema migrations. It does not install unsupported Supabase Postgres extensions, GraphQL, database webhooks, or logical replication slots.
 

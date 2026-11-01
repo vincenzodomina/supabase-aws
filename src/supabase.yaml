@@ -4,6 +4,21 @@ Parameters:
   VpcId:
     Type: AWS::EC2::VPC::Id
     Description: Existing VPC with DNS support and hostnames enabled.
+  InternalTrafficEncryption:
+    Type: String
+    Description: Require existing VPC encryption enforcement or use managed Service Connect TLS; see docs/Networking.md before changing modes.
+    AllowedValues: [vpc, service-connect-tls]
+    Default: vpc
+  ServiceConnectPrivateCaArn:
+    Type: String
+    Description: Existing same-region AWS Private CA tagged AmazonECSManaged=true; required for service-connect-tls. Short-lived mode is recommended.
+    Default: ''
+    AllowedPattern: '(^$|arn:[^:]+:acm-pca:[^:]+:[0-9]{12}:certificate-authority/[a-zA-Z0-9-]+)'
+  ServiceConnectKmsKeyArn:
+    Type: String
+    Description: Optional existing symmetric KMS key for Service Connect TLS secrets; empty uses the AWS-owned key. Its policy must permit ServiceConnectRole.
+    Default: ''
+    AllowedPattern: '(^$|arn:[^:]+:kms:[^:]+:[0-9]{12}:key/[a-zA-Z0-9-]+)'
   EcsCpuArchitecture:
     Type: String
     Description: Architecture for all ECS containers. ARM64 requires supported Fargate AZs; see docs/Compute.md. Lambda packaging is unchanged.
@@ -192,7 +207,7 @@ Parameters:
     Default: 4
   GatewayCpu:
     Type: String
-    Description: Gateway Fargate CPU units.
+    Description: Gateway Fargate CPU units; Service Connect TLS raises 256 to 512 for proxy headroom.
     AllowedValues:
       - '256'
       - '512'
@@ -201,7 +216,7 @@ Parameters:
     Default: '256'
   GatewayMemory:
     Type: String
-    Description: Gateway Fargate memory MiB; must be valid for selected CPU.
+    Description: Gateway Fargate memory MiB; Service Connect TLS applies a 1024 MiB floor to baseline values. Larger values must include proxy headroom.
     Default: '512'
   AuthMinTasks:
     Type: Number
@@ -217,7 +232,7 @@ Parameters:
     Default: 4
   AuthCpu:
     Type: String
-    Description: Auth Fargate CPU units.
+    Description: Auth Fargate CPU units; Service Connect TLS raises 256 to 512 for proxy headroom.
     AllowedValues:
       - '256'
       - '512'
@@ -226,7 +241,7 @@ Parameters:
     Default: '256'
   AuthMemory:
     Type: String
-    Description: Auth Fargate memory MiB; must be valid for selected CPU.
+    Description: Auth Fargate memory MiB; Service Connect TLS applies a 1024 MiB floor to baseline values. Larger values must include proxy headroom.
     Default: '512'
   RestMinTasks:
     Type: Number
@@ -242,7 +257,7 @@ Parameters:
     Default: 4
   RestCpu:
     Type: String
-    Description: Rest Fargate CPU units.
+    Description: Rest Fargate CPU units; Service Connect TLS raises 256 to 512 for proxy headroom.
     AllowedValues:
       - '256'
       - '512'
@@ -251,7 +266,7 @@ Parameters:
     Default: '256'
   RestMemory:
     Type: String
-    Description: Rest Fargate memory MiB; must be valid for selected CPU.
+    Description: Rest Fargate memory MiB; Service Connect TLS applies a 1024 MiB floor to baseline values. Larger values must include proxy headroom.
     Default: '512'
   StorageMinTasks:
     Type: Number
@@ -267,7 +282,7 @@ Parameters:
     Default: 4
   StorageCpu:
     Type: String
-    Description: Storage Fargate CPU units.
+    Description: Storage Fargate CPU units; Service Connect TLS raises 256 to 512 for proxy headroom.
     AllowedValues:
       - '256'
       - '512'
@@ -276,7 +291,7 @@ Parameters:
     Default: '256'
   StorageMemory:
     Type: String
-    Description: Storage Fargate memory MiB; must be valid for selected CPU.
+    Description: Storage Fargate memory MiB; Service Connect TLS applies a 2048 MiB floor to baseline values. Larger values must include proxy headroom.
     Default: '1024'
   AlarmTopicArn:
     Type: String
@@ -293,6 +308,21 @@ Parameters:
     MinValue: 0
     Description: Alert below this measured free-memory floor in bytes. Zero omits the alarm for externally managed monitoring.
 Conditions:
+  GatewayTlsCpuFloor: !And [!Condition UseServiceConnectTls, !Equals [!Ref 'GatewayCpu', '256']]
+  GatewayTlsMemoryFloor: !And [!Condition UseServiceConnectTls, !Equals [!Ref 'GatewayMemory', '512']]
+  AuthTlsCpuFloor: !And [!Condition UseServiceConnectTls, !Equals [!Ref 'AuthCpu', '256']]
+  AuthTlsMemoryFloor: !And [!Condition UseServiceConnectTls, !Equals [!Ref 'AuthMemory', '512']]
+  RestTlsCpuFloor: !And [!Condition UseServiceConnectTls, !Equals [!Ref 'RestCpu', '256']]
+  RestTlsMemoryFloor: !And [!Condition UseServiceConnectTls, !Equals [!Ref 'RestMemory', '512']]
+  StorageTlsCpuFloor: !And [!Condition UseServiceConnectTls, !Equals [!Ref 'StorageCpu', '256']]
+  StorageTlsMemoryFloor: !And
+    - !Condition UseServiceConnectTls
+    - !Or [!Equals [!Ref 'StorageMemory', '512'], !Equals [!Ref 'StorageMemory', '1024']]
+  UseVpcEncryption: !Equals [!Ref 'InternalTrafficEncryption', vpc]
+  UseServiceConnectTls: !Equals [!Ref 'InternalTrafficEncryption', service-connect-tls]
+  HasServiceConnectKmsKey: !And
+    - !Equals [!Ref 'InternalTrafficEncryption', service-connect-tls]
+    - !Not [!Equals [!Ref 'ServiceConnectKmsKeyArn', '']]
   ExpireStorageHistory: !Not [!Equals [!Ref 'StorageNoncurrentVersionRetentionDays', 0]]
   ManageServiceLogRetention: !Not [!Equals [!Ref 'ServiceLogRetentionDays', 0]]
   CollectContainerInsights: !Equals [!Ref 'ContainerInsights', enabled]
@@ -336,9 +366,15 @@ Resources:
           Value: !Ref 'ContainerInsights'
   Namespace:
     Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+    Condition: UseVpcEncryption
     Properties:
       Name: !Sub '${AWS::StackName}.internal'
       Vpc: !Ref 'VpcId'
+  TlsNamespace:
+    Type: AWS::ServiceDiscovery::HttpNamespace
+    Condition: UseServiceConnectTls
+    Properties:
+      Name: !Sub '${AWS::StackName}-tls'
   ApiAlbSG:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -1022,6 +1058,33 @@ Resources:
               - Effect: Allow
                 Action: s3:GetObject
                 Resource: !Sub 'arn:${AWS::Partition}:s3:::${ArtifactsBucket}/${CertificateKey}'
+  ServiceConnectRole:
+    Type: AWS::IAM::Role
+    Condition: UseServiceConnectTls
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSInfrastructureRolePolicyForServiceConnectTransportLayerSecurity'
+      Policies: !If
+        - HasServiceConnectKmsKey
+        - - PolicyName: EncryptTlsSecrets
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - kms:Encrypt
+                    - kms:Decrypt
+                    - kms:GenerateDataKey
+                    - kms:GenerateDataKeyPair
+                  Resource: !Ref 'ServiceConnectKmsKeyArn'
+        - !Ref 'AWS::NoValue'
   BootstrapRole:
     Type: AWS::IAM::Role
     Properties:
@@ -1037,6 +1100,12 @@ Resources:
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
+              - !If
+                - UseVpcEncryption
+                - Effect: Allow
+                  Action: ec2:DescribeVpcEncryptionControls
+                  Resource: '*'
+                - !Ref 'AWS::NoValue'
               - !If
                 - ManageServiceLogRetention
                 - Effect: Allow
@@ -1108,6 +1177,14 @@ Resources:
       Code:
         S3Bucket: !Ref 'ArtifactsBucket'
         S3Key: !Ref 'BootstrapKey'
+  EncryptionCheck:
+    Type: Custom::NetworkPrerequisites
+    Properties:
+      ServiceToken: !GetAtt 'BootstrapHandler.Arn'
+      ServiceTimeout: 960
+      Revision: !Ref 'BootstrapKey'
+      VpcId: !Ref 'VpcId'
+      Mode: !Ref 'InternalTrafficEncryption'
   Bootstrap:
     Type: Custom::DatabaseBootstrap
     Properties:
@@ -1122,6 +1199,7 @@ Resources:
       StorageSecret: !Ref 'StorageSecret'
       ApiSecret: !Ref 'ApiSecret'
     DependsOn:
+      - EncryptionCheck
       - BootstrapDatabaseIngress
       - BootstrapDatabaseEgress
   ServiceLogRetention:
@@ -1147,8 +1225,8 @@ Resources:
   GatewayTask:
     Type: AWS::ECS::TaskDefinition
     Properties:
-      Cpu: !Ref 'GatewayCpu'
-      Memory: !Ref 'GatewayMemory'
+      Cpu: !If [GatewayTlsCpuFloor, '512', !Ref 'GatewayCpu']
+      Memory: !If [GatewayTlsMemoryFloor, '1024', !Ref 'GatewayMemory']
       NetworkMode: awsvpc
       RequiresCompatibilities:
         - FARGATE
@@ -1163,7 +1241,9 @@ Resources:
           Command:
             - "@include src/gateway-entrypoint.sh"
           PortMappings:
-            - ContainerPort: 8000
+            - Name: gateway
+              AppProtocol: http
+              ContainerPort: 8000
           Environment:
             - Name: SERVICE_NAMESPACE
               Value: !Sub '${AWS::StackName}.internal'
@@ -2020,6 +2100,7 @@ Resources:
           StopTimeout: 60
   GatewayDiscovery:
     Type: AWS::ServiceDiscovery::Service
+    Condition: UseVpcEncryption
     Properties:
       Name: gateway
       NamespaceId: !Ref 'Namespace'
@@ -2043,8 +2124,37 @@ Resources:
           Subnets: !Ref 'PrivateSubnetIds'
           SecurityGroups:
             - !Ref 'GatewaySG'
-      ServiceRegistries:
-        - RegistryArn: !GetAtt 'GatewayDiscovery.Arn'
+      ServiceRegistries: !If
+        - UseVpcEncryption
+        - - RegistryArn: !GetAtt 'GatewayDiscovery.Arn'
+        - []
+      ServiceConnectConfiguration: !If
+        - UseServiceConnectTls
+        - Enabled: true
+          Namespace: !GetAtt 'TlsNamespace.Arn'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref 'LogGroup'
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: gateway-tls
+              mode: non-blocking
+              max-buffer-size: 10m
+          Services:
+            - PortName: gateway
+              DiscoveryName: gateway-tls
+              ClientAliases:
+                - DnsName: !Sub 'gateway.${AWS::StackName}.internal'
+                  Port: 8000
+              Timeout:
+                IdleTimeoutSeconds: 0
+                PerRequestTimeoutSeconds: 0
+              Tls:
+                IssuerCertificateAuthority:
+                  AwsPcaAuthorityArn: !Ref 'ServiceConnectPrivateCaArn'
+                RoleArn: !GetAtt 'ServiceConnectRole.Arn'
+                KmsKey: !If [HasServiceConnectKmsKey, !Ref 'ServiceConnectKmsKeyArn', !Ref 'AWS::NoValue']
+        - Enabled: false
       DeploymentConfiguration:
         MinimumHealthyPercent: 100
         MaximumPercent: 200
@@ -2059,6 +2169,7 @@ Resources:
           TargetGroupArn: !Ref 'GatewayTargets'
       HealthCheckGracePeriodSeconds: 90
     DependsOn:
+      - EncryptionCheck
       - Bootstrap
       - ApiListener
       - AuthService
@@ -2091,8 +2202,8 @@ Resources:
   AuthTask:
     Type: AWS::ECS::TaskDefinition
     Properties:
-      Cpu: !Ref 'AuthCpu'
-      Memory: !Ref 'AuthMemory'
+      Cpu: !If [AuthTlsCpuFloor, '512', !Ref 'AuthCpu']
+      Memory: !If [AuthTlsMemoryFloor, '1024', !Ref 'AuthMemory']
       NetworkMode: awsvpc
       RequiresCompatibilities:
         - FARGATE
@@ -2125,7 +2236,9 @@ Resources:
         - Name: auth
           Image: supabase/gotrue:v2.197.0@sha256:1736a63078f5922b198c4cbe50f80ab9a2d3b54fe8b7b6cfb2e9dc5dbbc12c6b
           PortMappings:
-            - ContainerPort: 9999
+            - Name: auth
+              AppProtocol: http
+              ContainerPort: 9999
           Environment:
             - Name: GOTRUE_API_HOST
               Value: 0.0.0.0
@@ -2223,6 +2336,7 @@ Resources:
         - Name: certificates
   AuthDiscovery:
     Type: AWS::ServiceDiscovery::Service
+    Condition: UseVpcEncryption
     Properties:
       Name: auth
       NamespaceId: !Ref 'Namespace'
@@ -2246,8 +2360,37 @@ Resources:
           Subnets: !Ref 'PrivateSubnetIds'
           SecurityGroups:
             - !Ref 'AuthSG'
-      ServiceRegistries:
-        - RegistryArn: !GetAtt 'AuthDiscovery.Arn'
+      ServiceRegistries: !If
+        - UseVpcEncryption
+        - - RegistryArn: !GetAtt 'AuthDiscovery.Arn'
+        - []
+      ServiceConnectConfiguration: !If
+        - UseServiceConnectTls
+        - Enabled: true
+          Namespace: !GetAtt 'TlsNamespace.Arn'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref 'LogGroup'
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: auth-tls
+              mode: non-blocking
+              max-buffer-size: 10m
+          Services:
+            - PortName: auth
+              DiscoveryName: auth-tls
+              ClientAliases:
+                - DnsName: !Sub 'auth.${AWS::StackName}.internal'
+                  Port: 9999
+              Timeout:
+                IdleTimeoutSeconds: 0
+                PerRequestTimeoutSeconds: 0
+              Tls:
+                IssuerCertificateAuthority:
+                  AwsPcaAuthorityArn: !Ref 'ServiceConnectPrivateCaArn'
+                RoleArn: !GetAtt 'ServiceConnectRole.Arn'
+                KmsKey: !If [HasServiceConnectKmsKey, !Ref 'ServiceConnectKmsKeyArn', !Ref 'AWS::NoValue']
+        - Enabled: false
       DeploymentConfiguration:
         MinimumHealthyPercent: 100
         MaximumPercent: 200
@@ -2257,6 +2400,7 @@ Resources:
       AvailabilityZoneRebalancing: ENABLED
       EnableECSManagedTags: true
     DependsOn:
+      - EncryptionCheck
       - Bootstrap
   AuthScaling:
     Type: AWS::ApplicationAutoScaling::ScalableTarget
@@ -2285,8 +2429,8 @@ Resources:
   RestTask:
     Type: AWS::ECS::TaskDefinition
     Properties:
-      Cpu: !Ref 'RestCpu'
-      Memory: !Ref 'RestMemory'
+      Cpu: !If [RestTlsCpuFloor, '512', !Ref 'RestCpu']
+      Memory: !If [RestTlsMemoryFloor, '1024', !Ref 'RestMemory']
       NetworkMode: awsvpc
       RequiresCompatibilities:
         - FARGATE
@@ -2319,7 +2463,9 @@ Resources:
         - Name: rest
           Image: postgrest/postgrest:v14.18@sha256:c7cd7e265a85b05248abf53f4473fcec7e327c282d0bd0cf60f1551996d09fcf
           PortMappings:
-            - ContainerPort: 3000
+            - Name: rest
+              AppProtocol: http
+              ContainerPort: 3000
           Environment:
             - Name: PGRST_DB_SCHEMAS
               Value: !Ref 'ApiSchemas'
@@ -2389,6 +2535,7 @@ Resources:
         - Name: certificates
   RestDiscovery:
     Type: AWS::ServiceDiscovery::Service
+    Condition: UseVpcEncryption
     Properties:
       Name: rest
       NamespaceId: !Ref 'Namespace'
@@ -2412,8 +2559,37 @@ Resources:
           Subnets: !Ref 'PrivateSubnetIds'
           SecurityGroups:
             - !Ref 'RestSG'
-      ServiceRegistries:
-        - RegistryArn: !GetAtt 'RestDiscovery.Arn'
+      ServiceRegistries: !If
+        - UseVpcEncryption
+        - - RegistryArn: !GetAtt 'RestDiscovery.Arn'
+        - []
+      ServiceConnectConfiguration: !If
+        - UseServiceConnectTls
+        - Enabled: true
+          Namespace: !GetAtt 'TlsNamespace.Arn'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref 'LogGroup'
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: rest-tls
+              mode: non-blocking
+              max-buffer-size: 10m
+          Services:
+            - PortName: rest
+              DiscoveryName: rest-tls
+              ClientAliases:
+                - DnsName: !Sub 'rest.${AWS::StackName}.internal'
+                  Port: 3000
+              Timeout:
+                IdleTimeoutSeconds: 0
+                PerRequestTimeoutSeconds: 0
+              Tls:
+                IssuerCertificateAuthority:
+                  AwsPcaAuthorityArn: !Ref 'ServiceConnectPrivateCaArn'
+                RoleArn: !GetAtt 'ServiceConnectRole.Arn'
+                KmsKey: !If [HasServiceConnectKmsKey, !Ref 'ServiceConnectKmsKeyArn', !Ref 'AWS::NoValue']
+        - Enabled: false
       DeploymentConfiguration:
         MinimumHealthyPercent: 100
         MaximumPercent: 200
@@ -2423,6 +2599,7 @@ Resources:
       AvailabilityZoneRebalancing: ENABLED
       EnableECSManagedTags: true
     DependsOn:
+      - EncryptionCheck
       - Bootstrap
   RestScaling:
     Type: AWS::ApplicationAutoScaling::ScalableTarget
@@ -2451,8 +2628,8 @@ Resources:
   StorageTask:
     Type: AWS::ECS::TaskDefinition
     Properties:
-      Cpu: !Ref 'StorageCpu'
-      Memory: !Ref 'StorageMemory'
+      Cpu: !If [StorageTlsCpuFloor, '512', !Ref 'StorageCpu']
+      Memory: !If [StorageTlsMemoryFloor, '2048', !Ref 'StorageMemory']
       NetworkMode: awsvpc
       RequiresCompatibilities:
         - FARGATE
@@ -2484,7 +2661,9 @@ Resources:
         - Name: storage
           Image: supabase/storage-api:v1.81.0@sha256:98ffec5d0678803783c30e404c27f4ec65e97efbe014088f2a86b4b8b54b9f54
           PortMappings:
-            - ContainerPort: 5000
+            - Name: storage
+              AppProtocol: http
+              ContainerPort: 5000
           Environment:
             - Name: POSTGREST_URL
               Value: !Sub 'http://rest.${AWS::StackName}.internal:3000'
@@ -2561,6 +2740,7 @@ Resources:
       TaskRoleArn: !GetAtt 'StorageRole.Arn'
   StorageDiscovery:
     Type: AWS::ServiceDiscovery::Service
+    Condition: UseVpcEncryption
     Properties:
       Name: storage
       NamespaceId: !Ref 'Namespace'
@@ -2584,8 +2764,37 @@ Resources:
           Subnets: !Ref 'PrivateSubnetIds'
           SecurityGroups:
             - !Ref 'StorageSG'
-      ServiceRegistries:
-        - RegistryArn: !GetAtt 'StorageDiscovery.Arn'
+      ServiceRegistries: !If
+        - UseVpcEncryption
+        - - RegistryArn: !GetAtt 'StorageDiscovery.Arn'
+        - []
+      ServiceConnectConfiguration: !If
+        - UseServiceConnectTls
+        - Enabled: true
+          Namespace: !GetAtt 'TlsNamespace.Arn'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref 'LogGroup'
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: storage-tls
+              mode: non-blocking
+              max-buffer-size: 10m
+          Services:
+            - PortName: storage
+              DiscoveryName: storage-tls
+              ClientAliases:
+                - DnsName: !Sub 'storage.${AWS::StackName}.internal'
+                  Port: 5000
+              Timeout:
+                IdleTimeoutSeconds: 0
+                PerRequestTimeoutSeconds: 0
+              Tls:
+                IssuerCertificateAuthority:
+                  AwsPcaAuthorityArn: !Ref 'ServiceConnectPrivateCaArn'
+                RoleArn: !GetAtt 'ServiceConnectRole.Arn'
+                KmsKey: !If [HasServiceConnectKmsKey, !Ref 'ServiceConnectKmsKeyArn', !Ref 'AWS::NoValue']
+        - Enabled: false
       DeploymentConfiguration:
         MinimumHealthyPercent: 100
         MaximumPercent: 200
@@ -2595,6 +2804,7 @@ Resources:
       AvailabilityZoneRebalancing: ENABLED
       EnableECSManagedTags: true
     DependsOn:
+      - EncryptionCheck
       - Bootstrap
       - AuthService
       - RestService
@@ -2648,7 +2858,9 @@ Resources:
       VpcId: !Ref 'VpcId'
       TargetType: ip
       Port: 8000
-      Protocol: HTTP
+      Protocol: !If [UseServiceConnectTls, HTTPS, HTTP]
+      HealthCheckProtocol: !If [UseServiceConnectTls, HTTPS, HTTP]
+      HealthCheckPort: traffic-port
       HealthCheckPath: /healthz
       Matcher:
         HttpCode: '200'
@@ -2680,8 +2892,8 @@ Resources:
   AdminTask:
     Type: AWS::ECS::TaskDefinition
     Properties:
-      Cpu: '1024'
-      Memory: '2048'
+      Cpu: !If [UseServiceConnectTls, '2048', '1024']
+      Memory: !If [UseServiceConnectTls, '4096', '2048']
       NetworkMode: awsvpc
       RequiresCompatibilities:
         - FARGATE
@@ -2770,7 +2982,9 @@ Resources:
           Image: supabase/studio:2026.10.12-sha-3699278@sha256:948770ec467f00e6ae34c35018ef7cb23d7b30eb806b42c2cc0d7bcfdcf8a7a8
           Essential: true
           PortMappings:
-            - ContainerPort: 3000
+            - Name: studio
+              AppProtocol: http
+              ContainerPort: 3000
           DependsOn:
             - ContainerName: meta
               Condition: HEALTHY
@@ -2846,7 +3060,9 @@ Resources:
       VpcId: !Ref 'VpcId'
       TargetType: ip
       Port: 3000
-      Protocol: HTTP
+      Protocol: !If [UseServiceConnectTls, HTTPS, HTTP]
+      HealthCheckProtocol: !If [UseServiceConnectTls, HTTPS, HTTP]
+      HealthCheckPort: traffic-port
       HealthCheckPath: /api/platform/profile
       Matcher:
         HttpCode: '200'
@@ -2883,11 +3099,39 @@ Resources:
         - ContainerName: studio
           ContainerPort: 3000
           TargetGroupArn: !Ref 'AdminTargets'
+      ServiceConnectConfiguration: !If
+        - UseServiceConnectTls
+        - Enabled: true
+          Namespace: !GetAtt 'TlsNamespace.Arn'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref 'LogGroup'
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: studio-tls
+              mode: non-blocking
+              max-buffer-size: 10m
+          Services:
+            - PortName: studio
+              DiscoveryName: studio-tls
+              ClientAliases:
+                - DnsName: !Sub 'studio.${AWS::StackName}.internal'
+                  Port: 3000
+              Timeout:
+                IdleTimeoutSeconds: 0
+                PerRequestTimeoutSeconds: 0
+              Tls:
+                IssuerCertificateAuthority:
+                  AwsPcaAuthorityArn: !Ref 'ServiceConnectPrivateCaArn'
+                RoleArn: !GetAtt 'ServiceConnectRole.Arn'
+                KmsKey: !If [HasServiceConnectKmsKey, !Ref 'ServiceConnectKmsKeyArn', !Ref 'AWS::NoValue']
+        - Enabled: false
       DeploymentConfiguration:
         DeploymentCircuitBreaker:
           Enable: true
           Rollback: true
     DependsOn:
+      - EncryptionCheck
       - Bootstrap
       - GatewayService
       - AdminListener
@@ -3015,6 +3259,11 @@ Outputs:
     Value: !GetAtt 'AdminAlb.DNSName'
     Condition: RunStudio
 Rules:
+  ServiceConnectRequiresPrivateCa:
+    RuleCondition: !Equals [!Ref 'InternalTrafficEncryption', service-connect-tls]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref 'ServiceConnectPrivateCaArn', '']]
+        AssertDescription: Provide an existing tagged AWS Private CA for Service Connect TLS.
   PrivateApiRequiresClients:
     RuleCondition: !Equals [!Ref 'ApiExposure', internal]
     Assertions:

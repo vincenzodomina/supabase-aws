@@ -207,7 +207,7 @@ class ArtifactTest(unittest.TestCase):
         self.assertEqual(template['Conditions'][resource['Condition']],
                          {'Fn::Not': [{'Fn::Equals': [{'Ref': 'ServiceLogRetentionDays'}, 0]}]})
         statements = template['Resources']['BootstrapRole']['Properties']['Policies'][0]['PolicyDocument']['Statement']
-        condition, policy, absent = next(s['Fn::If'] for s in statements if 'Fn::If' in s)
+        condition, policy, absent = next(s['Fn::If'] for s in statements if s.get('Fn::If', [None])[0] == resource['Condition'])
         self.assertEqual(condition, resource['Condition'])
         self.assertEqual(absent, {'Ref': 'AWS::NoValue'})
         self.assertEqual(set(policy['Action']), {'logs:CreateLogGroup', 'logs:PutRetentionPolicy'})
@@ -236,6 +236,49 @@ class ArtifactTest(unittest.TestCase):
         public_rule = template['Rules']['PublicApiRequiresSubnets']
         self.assertEqual(public_rule['RuleCondition'], template['Conditions'][public_condition])
         self.assertEqual(public_rule['Assertions'][0]['Assert'], {'Fn::Not': [{'Fn::Contains': [{'Ref': 'PublicSubnetIds'}, '']}]})
+
+    def test_internal_encryption_has_two_protected_modes_and_gates_all_services(self):
+        template, errors = decode_str(subprocess.check_output([str(ROOT/'src/deploy.sh'), '--template'], text=True, timeout=10))
+        self.assertFalse(errors)
+        parameters, resources = template['Parameters'], template['Resources']
+        self.assertEqual(parameters['InternalTrafficEncryption']['Default'], 'vpc')
+        self.assertEqual(parameters['InternalTrafficEncryption']['AllowedValues'], ['vpc', 'service-connect-tls'])
+        for condition, mode in [('UseVpcEncryption', 'vpc'), ('UseServiceConnectTls', 'service-connect-tls')]:
+            self.assertEqual(template['Conditions'][condition], {'Fn::Equals': [{'Ref': 'InternalTrafficEncryption'}, mode]})
+        self.assertEqual(resources['EncryptionCheck']['Properties']['Mode'], {'Ref': 'InternalTrafficEncryption'})
+        self.assertEqual(resources['EncryptionCheck']['Properties']['VpcId'], {'Ref': 'VpcId'})
+        self.assertIn('EncryptionCheck', resources['Bootstrap']['DependsOn'])
+        self.assertIn('ServiceConnectRequiresPrivateCa', template['Rules'])
+        self.assertEqual(resources['ServiceConnectRole']['Condition'], 'UseServiceConnectTls')
+        role = resources['ServiceConnectRole']['Properties']
+        self.assertEqual(role['AssumeRolePolicyDocument']['Statement'][0]['Principal'], {'Service': 'ecs.amazonaws.com'})
+        self.assertEqual(role['Policies']['Fn::If'][0], 'HasServiceConnectKmsKey')
+        for name, resource in resources.items():
+            if resource['Type'] != 'AWS::ECS::Service':
+                continue
+            with self.subTest(service=name):
+                self.assertIn('EncryptionCheck', resource['DependsOn'])
+                mode, config, disabled = resource['Properties']['ServiceConnectConfiguration']['Fn::If']
+                self.assertEqual(mode, 'UseServiceConnectTls')
+                self.assertEqual(disabled, {'Enabled': False})
+                self.assertTrue(config['Enabled'])
+                self.assertEqual(config['Namespace'], {'Fn::GetAtt': ['TlsNamespace', 'Arn']})
+                endpoint, = config['Services']
+                task = resources[name.replace('Service', 'Task')]['Properties']
+                port, = [p for c in task['ContainerDefinitions'] for p in c.get('PortMappings', []) if p['Name'] == endpoint['PortName']]
+                self.assertEqual(endpoint['ClientAliases'][0]['Port'], port['ContainerPort'])
+                self.assertEqual(port['AppProtocol'], 'http')
+                self.assertNotIn('IngressPortOverride', endpoint)
+                self.assertEqual(endpoint['Timeout'], {'IdleTimeoutSeconds': 0, 'PerRequestTimeoutSeconds': 0})
+                self.assertEqual(endpoint['Tls']['IssuerCertificateAuthority'], {'AwsPcaAuthorityArn': {'Ref': 'ServiceConnectPrivateCaArn'}})
+                self.assertEqual(endpoint['Tls']['RoleArn'], {'Fn::GetAtt': ['ServiceConnectRole', 'Arn']})
+                if name != 'AdminService':
+                    self.assertEqual(resource['Properties']['ServiceRegistries']['Fn::If'][2], [])
+                    self.assertEqual(resources[name.replace('Service', 'Discovery')]['Condition'], 'UseVpcEncryption')
+        for name in ['GatewayTargets', 'AdminTargets']:
+            for field in ['Protocol', 'HealthCheckProtocol']:
+                self.assertEqual(resources[name]['Properties'][field], {'Fn::If': ['UseServiceConnectTls', 'HTTPS', 'HTTP']})
+            self.assertEqual(resources[name]['Properties']['HealthCheckPort'], 'traffic-port')
 
     def test_rendered_template_and_all_tasks_fit_size_budgets(self):
         rendered = subprocess.check_output([str(ROOT/'src/deploy.sh'), '--template'], timeout=10)
