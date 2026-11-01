@@ -29,11 +29,10 @@ db=$(resource Database)
 aws rds describe-db-instances --db-instance-identifier "$db" > "$rotation_dir/database.json"
 jq --arg revision "$(date -u +%Y%m%dT%H%M%SZ)" '.CredentialRevision=$revision' \
   "$parameters" > "$rotation_dir/parameters.json"
-./src/deploy.sh --stack-name "$stack" --region "$AWS_REGION" \
-  --parameters "$rotation_dir/parameters.json" --artifacts-bucket "$artifacts_bucket"
+./src/deploy.sh --template > "$rotation_dir/template.yaml"
 ```
 
-Review the returned change set as a preview. The later `--apply` command generates a fresh change set from the supplied files; keep the checkout, artifacts, and parameter file unchanged between preview and deployment. Expect bootstrap refresh and all enabled ECS services to update, with no database replacement. Secret contents are fetched at execution/task launch, not pinned by the reviewed change set; freeze secret writes throughout the operation. Supply the existing profile/execution role as required by the deployment.
+Review the rendered template and parameter changes before publishing credentials; keep the checkout, artifacts, and parameter file unchanged through deployment. Rendering does not calculate AWS resource changes. A credential refresh should update bootstrap and enabled ECS services without replacing the database. Secret contents are fetched at execution/task launch; freeze other secret writers throughout the operation. Supply the existing profile/execution role as required by the deployment.
 
 Select one secret below, then save its current complete JSON object:
 
@@ -132,7 +131,7 @@ After the selected preparation and any master-password verification, publish the
 aws secretsmanager put-secret-value --region "$secret_region" --secret-id "$secret" \
   --secret-string "file://$rotation_dir/next.json" --query VersionId --output text
 ./src/deploy.sh --stack-name "$stack" --region "$AWS_REGION" \
-  --parameters "$rotation_dir/parameters.json" --artifacts-bucket "$artifacts_bucket" --apply
+  --parameters "$rotation_dir/parameters.json" --artifacts-bucket "$artifacts_bucket"
 ```
 
 Wait for successful stack completion and confirm every enabled service has completed its new deployment, old tasks have drained, and replica minimums are restored. Verify affected database logins, Auth login/refresh, private RLS access, an S3 upload/download/delete, and optional Studio/meta access. For opaque rotation, check that old opaque keys fail while existing sessions and legacy keys still work. For signing rotation, check old access tokens fail and new tokens work. Verify SMTP delivery separately. These AWS checks remain manual acceptance; local Docker/Moto tests cannot establish RDS propagation, ECS rollout ordering, or SES delivery.
@@ -150,4 +149,4 @@ CloudFormation rollback does not undo secret writes or a committed database pass
 | SMTP rollout or delivery failed | Keep the old SMTP credential active. Restore the previous secret and refresh; verify delivery before retiring either key. |
 | API-key cutover failed | Restore the complete previous bundle and refresh only if those keys remain trusted. Update clients/verifier caches consistently; tokens minted with the rejected new key will fail. Prefer forward recovery for compromised keys. |
 
-Use the same file-based `put-secret-value` command with `previous.json` to restore a trusted object. Keep recovery files until resolved; never patch only the URI or signing subset. Wait for stack rollback to settle (resolve `UPDATE_ROLLBACK_FAILED` first), create/review a new change set with a fresh revision, and repeat verification before restoring traffic.
+Use the same file-based `put-secret-value` command with `previous.json` to restore a trusted object. Keep recovery files until resolved; never patch only the URI or signing subset. Wait for stack rollback to settle (resolve `UPDATE_ROLLBACK_FAILED` first), review the source and parameters with a fresh revision, redeploy, and repeat verification before restoring traffic.
