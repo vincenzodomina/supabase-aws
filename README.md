@@ -119,6 +119,22 @@ New public-schema tables are not automatically granted to API roles. Explicitly 
 
 Set CPU/memory using valid Fargate combinations. Size service maximums and deployment surge together with RDS connection capacity; horizontal service scaling does not scale RDS. Initial per-replica pools are limited to five connections for Auth, PostgREST, and Storage, but migrations and background work can create additional connections. Retain database headroom. One replica is an explicit availability compromise.
 
+The configured pool budget at maximum scale is `5 × (AuthMaxTasks + RestMaxTasks + StorageMaxTasks)`: 60 connections at the defaults, or 120 if all three services overlap at their 200% rolling-deployment limit. This is only the configured pool component, not a total connection cap. Add headroom for listeners, migrations, bootstrap, Studio/meta, external applications, and database-reserved connections.
+
+Before production, use an approved database client to inspect the actual instance settings and connection usage:
+
+```sql
+SELECT name, setting FROM pg_settings
+WHERE name IN ('max_connections', 'superuser_reserved_connections',
+               'reserved_connections', 'rds.rds_superuser_reserved_connections');
+SELECT usename, application_name, count(*) FROM pg_stat_activity
+WHERE backend_type = 'client backend' GROUP BY usename, application_name;
+```
+
+Keep the deployment budget plus measured headroom below usable capacity; verify replacement under representative load and repeat after changing the RDS class, pool settings, or service maxima. [RDS connection limits](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/CHAP_Limits.html) depend on database configuration and memory. CloudWatch `DatabaseConnections` does not count every internal database session.
+
+If enterprise monitoring does not already cover these signals, set positive `DatabaseConnectionAlarmThreshold` and `DatabaseFreeableMemoryAlarmBytes` values, with an existing `AlarmTopicArn` for notifications. Choose a connection warning below usable capacity and a free-memory floor from workload measurements. Each alarm requires two breaching one-minute periods out of three; without a topic, alarm state remains visible in CloudWatch. Zero omits that alarm and its cost. These alerts do not enforce a connection limit or automatically resize RDS.
+
 Application Auto Scaling owns core service replica counts, so routine deployments preserve scaled capacity. New services initially start with one task; scalable-target registration raises them to their configured minimum. Verify all minimums are reached before serving traffic. Changing minimum or maximum bounds can adjust current capacity. Container Insights uses a separate performance-log group outside `LogRetentionDays`; disabling collection does not remove existing telemetry.
 
 The stack incurs ongoing charges for RDS, Fargate, ALBs, storage, logs, and optional administration. Existing NAT/endpoints and outbound data incur their own charges. Private VPC traffic between ALBs and services is HTTP; client ingress and database connections use TLS. Add end-to-end service TLS if your requirements demand it.

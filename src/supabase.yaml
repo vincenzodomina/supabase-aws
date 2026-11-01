@@ -267,7 +267,19 @@ Parameters:
     Type: String
     Default: ''
     Description: Optional existing SNS topic ARN for operational alarms.
+  DatabaseConnectionAlarmThreshold:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    Description: Alert at this measured connection count, below usable RDS capacity. Zero omits the alarm for externally managed monitoring.
+  DatabaseFreeableMemoryAlarmBytes:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    Description: Alert below this measured free-memory floor in bytes. Zero omits the alarm for externally managed monitoring.
 Conditions:
+  MonitorDatabaseConnections: !Not [!Equals [!Ref 'DatabaseConnectionAlarmThreshold', 0]]
+  MonitorDatabaseMemory: !Not [!Equals [!Ref 'DatabaseFreeableMemoryAlarmBytes', 0]]
   PublicApi: !Equals [!Ref 'ApiExposure', internet-facing]
   PrivateApi: !Equals [!Ref 'ApiExposure', internal]
   HasSesSmtpKmsKey: !Not
@@ -2856,6 +2868,48 @@ Resources:
       EvaluationPeriods: 2
       Threshold: 80
       ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If
+        - HasAlarmTopic
+        - - !Ref 'AlarmTopicArn'
+        - !Ref 'AWS::NoValue'
+  DatabaseConnectionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: MonitorDatabaseConnections
+    Properties:
+      AlarmDescription: RDS connections reached the operator's capacity warning threshold; inspect pools, deployment overlap, and external clients.
+      Namespace: AWS/RDS
+      MetricName: DatabaseConnections
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref 'Database'
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      Threshold: !Ref 'DatabaseConnectionAlarmThreshold'
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If
+        - HasAlarmTopic
+        - - !Ref 'AlarmTopicArn'
+        - !Ref 'AWS::NoValue'
+  DatabaseMemoryAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: MonitorDatabaseMemory
+    Properties:
+      AlarmDescription: RDS freeable memory fell below the operator's measured floor; inspect workload and connection pressure before increasing capacity.
+      Namespace: AWS/RDS
+      MetricName: FreeableMemory
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref 'Database'
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      Threshold: !Ref 'DatabaseFreeableMemoryAlarmBytes'
+      ComparisonOperator: LessThanThreshold
       TreatMissingData: notBreaching
       AlarmActions: !If
         - HasAlarmTopic
