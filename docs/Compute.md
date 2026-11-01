@@ -40,6 +40,26 @@ If enterprise monitoring does not already cover these signals, set positive `Dat
 
 Application Auto Scaling owns core service replica counts, so routine deployments preserve scaled capacity. New services initially start with one task; scalable-target registration raises them to their configured minimum. Verify all minimums are reached before serving traffic. Changing minimum or maximum bounds can adjust current capacity.
 
+## Query statistics
+
+Set `DatabaseQueryStatistics=top` to collect top-level query execution statistics; the default `none` disables collection. The stack installs `pg_stat_statements` in the private `supabase_aws` schema, with no view or function access for API/service roles. Connect as the database administrator through an approved private client; no exporter or additional AWS resource is deployed.
+
+[RDS PostgreSQL preloads the module by default](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Appendix.PostgreSQL.CommonDBATasks.html). The stack preserves that AWS default. Verify effective settings after deployment; if the library is absent, an approved parameter-group change and restart are required before diagnostics work.
+
+```sql
+SELECT name, setting FROM pg_settings
+WHERE name IN ('shared_preload_libraries', 'compute_query_id',
+               'pg_stat_statements.track', 'pg_stat_statements.track_utility');
+SELECT calls, total_exec_time, mean_exec_time, rows, query
+FROM supabase_aws.pg_stat_statements
+WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+ORDER BY total_exec_time DESC LIMIT 20;
+```
+
+Expect the preload list to include `pg_stat_statements`, query IDs to be `auto` or `on`, tracking to match the parameter, and utility tracking to be off. Collection excludes utility commands such as DDL; planning statistics retain PostgreSQL's disabled default. Measure overhead on the representative workload before enabling it in production.
+
+Query normalization is not a privacy guarantee: query text and object names can still contain sensitive information. Treat results as restricted operational data. Returning to `none` stops new collection but retains existing statistics, including across restarts under the module's defaults. If erasure is required, an authorized administrator can run `SELECT supabase_aws.pg_stat_statements_reset();`; this clears instance-wide statistics and must be coordinated with other diagnostics. See [PostgreSQL's collection and reset behavior](https://www.postgresql.org/docs/17/pgstatstatements.html).
+
 ## RDS workload sizing
 
 `DatabaseInstanceClass` defaults to `db.t4g.medium`; that is a starting configuration, not production capacity evidence. [AWS recommends T classes for development/test and other non-production workloads](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/rds-metrics.html). Evaluate a supported fixed-performance class for sustained enterprise workloads before production acceptance. Preserve Multi-AZ availability, encryption, recovery, and connection headroom when comparing cost.

@@ -149,9 +149,14 @@ def run(directory, package):
     (directory/'rds-ca.pem').write_bytes(cert.public_bytes(serialization.Encoding.PEM))
     (directory/'server.key').write_bytes(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
     certmount = str(directory)+':/certs:ro'
+    db_parameters = template['Resources']['DbParameters']['Properties']['Parameters']
+    tracking_parameter = db_parameters['pg_stat_statements.track']['Ref']
     pgport = start('db', DATABASE_IMAGE, {'POSTGRES_PASSWORD': password}, 5432, 'db', mounts=[certmount],
                    entrypoint='/bin/bash', command=['-ec',
-                   'cp /certs/server.key /certs/rds-ca.pem /tmp/; chown postgres:postgres /tmp/server.key /tmp/rds-ca.pem; chmod 0600 /tmp/server.key /tmp/rds-ca.pem; exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/tmp/rds-ca.pem -c ssl_key_file=/tmp/server.key'])
+                   'cp /certs/server.key /certs/rds-ca.pem /tmp/; chown postgres:postgres /tmp/server.key /tmp/rds-ca.pem; chmod 0600 /tmp/server.key /tmp/rds-ca.pem; exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/tmp/rds-ca.pem -c ssl_key_file=/tmp/server.key "$@"',
+                   '--', '-c', 'shared_preload_libraries=pg_stat_statements',
+                   '-c', 'pg_stat_statements.track='+values[tracking_parameter],
+                   '-c', 'pg_stat_statements.track_utility='+db_parameters['pg_stat_statements.track_utility']])
     database = dict(host='127.0.0.1', port=pgport, user='postgres', password=password, dbname='postgres',
                     sslmode='verify-full', sslrootcert=str(directory/'rds-ca.pem'), connect_timeout=3)
     for _ in range(60):
@@ -257,13 +262,33 @@ def run(directory, package):
     with psycopg.connect(**database) as connection:
         assert connection.execute("SELECT pg_has_role('anon', 'postgres', 'MEMBER')").fetchone() == (True,)
         connection.execute('DROP ROLE anon')
-    identity = invoke(lambdaport, 'Create')
+    upgrade_names = migration_names[migration_names.index('migrations/20261101131622_rds_query_statistics.sql'):]
+    upgrade_files = {directory/'lambda'/name: (directory/'lambda'/name).read_bytes() for name in upgrade_names}
+    try:
+        for path in upgrade_files:
+            path.unlink()
+        identity = invoke(lambdaport, 'Create')
+        with psycopg.connect(**database) as connection:
+            previous_history = connection.execute('SELECT * FROM supabase_aws.migrations ORDER BY version').fetchall()
+            assert connection.execute("SELECT count(*) FROM pg_extension WHERE extname = 'pg_stat_statements'").fetchone() == (0,)
+    finally:
+        for path, content in upgrade_files.items():
+            path.write_bytes(content)
+    with psycopg.connect(**database) as connection:
+        connection.execute('CREATE EXTENSION pg_stat_statements WITH SCHEMA public')
+    invoke(lambdaport, 'Update', expected='FAILED', physical_id=identity)
+    with psycopg.connect(**database) as connection:
+        assert connection.execute('SELECT * FROM supabase_aws.migrations ORDER BY version').fetchall() == previous_history
+        assert connection.execute("SELECT extnamespace::regnamespace::text FROM pg_extension WHERE extname = 'pg_stat_statements'").fetchone() == ('public',)
+        connection.execute('DROP EXTENSION pg_stat_statements')
+    assert invoke(lambdaport, 'Update', physical_id=identity) == identity
 
     def migration_history():
         with psycopg.connect(**database) as connection:
             return connection.execute('SELECT version, checksum, applied_at FROM supabase_aws.migrations ORDER BY version').fetchall()
 
     history = migration_history()
+    assert history[:len(previous_history)] == previous_history, 'Forward migration changed applied history'
     assert [(version, checksum) for version, checksum, _ in history] == [
         (Path(name).stem, hashlib.sha256((ROOT/'src'/name).read_bytes()).hexdigest()) for name in migration_names]
     try:
@@ -278,6 +303,26 @@ def run(directory, package):
     with psycopg.connect(**database) as connection:
         for role in ['anon', 'authenticated', 'service_role', 'authenticator', 'supabase_auth_admin', 'supabase_storage_admin']:
             assert not connection.execute("SELECT has_schema_privilege(%s, 'supabase_aws', 'USAGE')", (role,)).fetchone()[0]
+            table_access = connection.execute("SELECT has_table_privilege(%s, oid, 'SELECT') FROM pg_class WHERE relnamespace = 'supabase_aws'::regnamespace AND relkind IN ('r', 'v')", (role,)).fetchall()
+            assert table_access and not any(allowed for (allowed,) in table_access), 'Diagnostic table exposed to '+role
+            function_access = connection.execute("SELECT has_function_privilege(%s, oid, 'EXECUTE') FROM pg_proc WHERE pronamespace = 'supabase_aws'::regnamespace", (role,)).fetchall()
+            assert function_access and not any(allowed for (allowed,) in function_access), 'Diagnostic function exposed to '+role
+    with psycopg.connect(**database, autocommit=True) as connection:
+        assert connection.execute('SHOW pg_stat_statements.track').fetchone() == ('none',)
+        assert connection.execute('SHOW pg_stat_statements.track_utility').fetchone() == ('off',)
+        connection.execute('SET pg_stat_statements.track = top')
+        for _ in range(2):
+            connection.execute('SELECT 731 AS supabase_statistics_enabled_probe').fetchone()
+        assert connection.execute("SELECT calls FROM supabase_aws.pg_stat_statements WHERE query LIKE %s", ('%supabase_statistics_enabled_probe%',)).fetchone() == (2,)
+        connection.execute('CREATE TEMP TABLE supabase_statistics_utility_probe (id int)')
+        connection.execute('SET pg_stat_statements.track = none')
+        connection.execute('SELECT 913 AS supabase_statistics_disabled_probe').fetchone()
+        assert connection.execute("SELECT count(*) FROM supabase_aws.pg_stat_statements WHERE query LIKE %s OR query LIKE %s", ('%supabase_statistics_disabled_probe%', '%supabase_statistics_utility_probe%')).fetchone() == (0,)
+        assert invoke(lambdaport, 'Update', physical_id=identity) == identity
+        assert connection.execute("SELECT calls FROM supabase_aws.pg_stat_statements WHERE query LIKE %s", ('%supabase_statistics_enabled_probe%',)).fetchone() == (2,)
+        connection.execute('SELECT supabase_aws.pg_stat_statements_reset()').fetchone()
+        assert connection.execute('SELECT count(*) FROM supabase_aws.pg_stat_statements').fetchone() == (0,)
+    print('PASS: query statistics upgrade, opt-in collection, utility exclusion, private access and retry preservation.', flush=True)
     for name in fixture_secrets:
         fixture_secrets[name] = json.loads(sm.get_secret_value(SecretId=properties[name])['SecretString'])
     keys = dict(fixture_secrets['ApiSecret'])
