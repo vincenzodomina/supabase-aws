@@ -65,6 +65,35 @@ def generate_keys(legacy_secret):
     return result
 
 
+def api_keys(existing, legacy):
+    if legacy is not None:
+        legacy = {key: legacy[key] for key in ('JWT_SECRET', 'ANON_KEY', 'SERVICE_ROLE_KEY')}
+    if 'JWT_KEYS' in existing:
+        if legacy is not None and any(existing[key] != value for key, value in legacy.items()):
+            raise ValueError('Legacy credentials differ from the initialized API bundle')
+        return existing
+    if legacy is None:
+        return generate_keys(existing['JWT_SECRET'])
+    secret = legacy['JWT_SECRET']
+    if not isinstance(secret, str) or len(secret) < 32:
+        raise ValueError('Legacy JWT secret must contain at least 32 characters')
+    for name, role in [('ANON_KEY', 'anon'), ('SERVICE_ROLE_KEY', 'service_role')]:
+        header, payload, signature = legacy[name].split('.')
+        def decode(value):
+            return base64.b64decode(value + '=' * (-len(value) % 4), altchars=b'-_', validate=True)
+        claims = json.loads(decode(payload))
+        if json.loads(decode(header)).get('alg') != 'HS256' or claims.get('role') != role:
+            raise ValueError('Legacy API key has an unexpected algorithm or role')
+        if type(claims.get('exp')) is not int or claims['exp'] <= time.time():
+            raise ValueError('Legacy API key must have a future expiry')
+        if 'nbf' in claims and (type(claims['nbf']) is not int or claims['nbf'] > time.time()):
+            raise ValueError('Legacy API key is not valid yet')
+        expected = hmac.digest(secret.encode(), f'{header}.{payload}'.encode(), 'sha256')
+        if not hmac.compare_digest(decode(signature), expected):
+            raise ValueError('Legacy API key signature does not match the JWT secret')
+    return dict(generate_keys(secret), **legacy)
+
+
 def initialize(connection, passwords):
     migrations = [(path.stem, path.read_bytes()) for path in sorted(Path(__file__).with_name('migrations').glob('*.sql'))]
     if not migrations:
@@ -98,6 +127,12 @@ def bootstrap(properties):
         return json.loads(client.get_secret_value(SecretId=arn)['SecretString'])
 
     master = read(properties['DatabaseSecret'])
+    if master.get('username') != 'postgres' or not isinstance(master.get('password'), str) or not master['password']:
+        raise ValueError('Database secret must contain username postgres and a password')
+    arn = properties['ApiSecret']
+    existing = read(arn)
+    legacy = read(properties['LegacyApiKeysSecret']) if properties.get('LegacyApiKeysSecret') else None
+    keys = api_keys(existing, legacy)
     credentials = {name: (properties[key], read(properties[key])) for name, key in [
         ('supabase_auth_admin', 'AuthSecret'), ('authenticator', 'RestSecret'),
         ('supabase_storage_admin', 'StorageSecret')]}
@@ -111,11 +146,8 @@ def bootstrap(properties):
         value['uri'] = (f"postgresql://{name}:{quote(value['password'], safe='')}@{host}:{port}/postgres"
                         '?sslmode=verify-full&sslrootcert=/certs/rds-ca.pem')
         client.put_secret_value(SecretId=arn, SecretString=json.dumps(value))
-    arn = properties['ApiSecret']
-    value = read(arn)
-    if 'JWT_KEYS' not in value:
-        value = generate_keys(value['JWT_SECRET'])
-        client.put_secret_value(SecretId=arn, SecretString=json.dumps(value))
+    if keys != existing:
+        client.put_secret_value(SecretId=properties['ApiSecret'], SecretString=json.dumps(keys))
     print('Database prerequisites and service credentials are ready.')
 
 

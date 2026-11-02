@@ -3,6 +3,7 @@
 import base64
 import datetime
 import hashlib
+import hmac
 import ipaddress
 import json
 import os
@@ -29,7 +30,7 @@ from acceptance import check_storage
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT/'src'))
-from bootstrap import generate_keys
+from bootstrap import generate_keys, token as sign_token
 
 template, errors = decode_str(subprocess.check_output([str(ROOT/'src/deploy.sh'), '--template'], text=True, timeout=10))
 assert not errors, errors
@@ -329,11 +330,70 @@ def run(directory, package):
     sensitive_values = [password, *keys.values()]
     print('PASS: packaged Lambda, rollback/recovery, baseline validation, immutable migration history, private ledger and TLS rejection.', flush=True)
 
+    # Import into an uninitialized bundle, as an existing installation would.
+    original_api_arn = properties['ApiSecret']
+    legacy = {name: keys[name] for name in ['JWT_SECRET', 'ANON_KEY', 'SERVICE_ROLE_KEY']}
+    properties['LegacyApiKeysSecret'] = sm.create_secret(Name='legacy-source', SecretString=json.dumps(legacy))['ARN']
+    properties['ApiSecret'] = sm.create_secret(Name='adopted-api', SecretString=json.dumps({'JWT_SECRET': 'unused-generated-secret'}))['ARN']
+    properties['DatabaseSecret'] = sm.create_secret(Name='existing-master', SecretString=json.dumps(fixture_secrets['DatabaseSecret']))['ARN']
+    service_version = sm.get_secret_value(SecretId=properties['AuthSecret'])['VersionId']
+    def database_passwords():
+        with psycopg.connect(**database) as connection:
+            return connection.execute("SELECT rolname, rolpassword FROM pg_authid ORDER BY rolname").fetchall()
+    previous_passwords = database_passwords()
+    def legacy_key(role='anon', expires=None, algorithm='HS256', not_before=None):
+        claims = {'role': role, 'exp': expires if expires is not None else int(time.time()) + 3600}
+        if not_before is not None:
+            claims['nbf'] = not_before
+        return sign_token({'alg': algorithm}, claims, lambda value: hmac.digest(legacy['JWT_SECRET'].encode(), value, 'sha256'))
+    for invalid in [dict(legacy, ANON_KEY=legacy['SERVICE_ROLE_KEY']),
+                    dict(legacy, JWT_SECRET='wrong-secret-' * 4),
+                    dict(legacy, JWT_SECRET='short'),
+                    dict(legacy, ANON_KEY=legacy_key(expires=1)),
+                    dict(legacy, ANON_KEY=legacy_key(algorithm='none')),
+                    dict(legacy, ANON_KEY=legacy_key(not_before=int(time.time()) + 3600)),
+                    dict(legacy, ANON_KEY='malformed')]:
+        sm.put_secret_value(SecretId=properties['LegacyApiKeysSecret'], SecretString=json.dumps(invalid))
+        invoke(lambdaport, 'Update', expected='FAILED', physical_id=identity)
+        assert sm.get_secret_value(SecretId=properties['AuthSecret'])['VersionId'] == service_version
+        assert migration_history() == history
+        assert database_passwords() == previous_passwords
+        assert 'JWT_KEYS' not in json.loads(sm.get_secret_value(SecretId=properties['ApiSecret'])['SecretString'])
+    sm.put_secret_value(SecretId=properties['DatabaseSecret'], SecretString=json.dumps({'username': 'other-admin', 'password': password}))
+    invoke(lambdaport, 'Update', expected='FAILED', physical_id=identity)
+    assert sm.get_secret_value(SecretId=properties['AuthSecret'])['VersionId'] == service_version
+    sm.put_secret_value(SecretId=properties['DatabaseSecret'], SecretString=json.dumps(fixture_secrets['DatabaseSecret']))
+    source_master = sm.get_secret_value(SecretId=properties['DatabaseSecret'])['VersionId']
+    sm.put_secret_value(SecretId=properties['LegacyApiKeysSecret'], SecretString=json.dumps(legacy))
+    source_keys = sm.get_secret_value(SecretId=properties['LegacyApiKeysSecret'])['VersionId']
+    invoke(lambdaport, 'Update', physical_id=identity)
+    keys = json.loads(sm.get_secret_value(SecretId=properties['ApiSecret'])['SecretString'])
+    assert all(keys[name] == value for name, value in legacy.items())
+    assert keys['SUPABASE_PUBLISHABLE_KEY'] != fixture_secrets['ApiSecret']['SUPABASE_PUBLISHABLE_KEY']
+    for _ in range(2):
+        invoke(lambdaport, 'Update', physical_id=identity)
+        assert json.loads(sm.get_secret_value(SecretId=properties['ApiSecret'])['SecretString']) == keys
+    assert sm.get_secret_value(SecretId=properties['DatabaseSecret'])['VersionId'] == source_master
+    assert sm.get_secret_value(SecretId=properties['LegacyApiKeysSecret'])['VersionId'] == source_keys
+    assert json.loads(sm.get_secret_value(SecretId=original_api_arn)['SecretString']) == fixture_secrets['ApiSecret']
+    sm.put_secret_value(SecretId=properties['LegacyApiKeysSecret'], SecretString=json.dumps(dict(legacy, ANON_KEY=legacy_key())))
+    service_version = sm.get_secret_value(SecretId=properties['AuthSecret'])['VersionId']
+    invoke(lambdaport, 'Update', expected='FAILED', physical_id=identity)
+    assert sm.get_secret_value(SecretId=properties['AuthSecret'])['VersionId'] == service_version
+    assert json.loads(sm.get_secret_value(SecretId=properties['ApiSecret'])['SecretString']) == keys
+    properties.pop('LegacyApiKeysSecret')
+    invoke(lambdaport, 'Update', physical_id=identity)
+    fixture_secrets['ApiSecret'] = dict(keys)
+    values['ExistingDatabaseSecretArn'] = 'DatabaseSecret'
+    sensitive_values.extend(keys.values())
+    print('PASS: credential adoption validates before database writes, retains exact legacy keys, preserves source secrets and rejects replacement; removing the input preserves the bundle.', flush=True)
+
     def resolve_value(value):
         if not isinstance(value, dict):
             return value
         if 'Ref' in value:
-            return None if value['Ref'] == 'AWS::NoValue' else values[value['Ref']]
+            name = value['Ref']
+            return None if name == 'AWS::NoValue' else name if name in fixture_secrets else values[name]
         if 'Fn::If' in value:
             condition, yes, no = value['Fn::If']
             return resolve_value(yes if resolve_value(template['Conditions'][condition]) else no)
@@ -345,7 +405,12 @@ def run(directory, package):
         if value == {'Fn::GetAtt': ['Database', 'Endpoint.Address']}:
             return 'db'
         if 'Fn::Sub' in value:
-            return re.sub(r'\$\{([^}]+)\}', lambda m: str(values[m[1]]), value['Fn::Sub'])
+            expression = value['Fn::Sub']
+            bindings = dict(values, **{name: name for name in fixture_secrets})
+            if isinstance(expression, list):
+                expression, substitutions = expression
+                bindings.update({name: resolve_value(item) for name, item in substitutions.items()})
+            return re.sub(r'\$\{([^}]+)\}', lambda m: str(bindings[m[1]]), expression)
         return {key: resolve_value(item) for key, item in value.items()}
 
     storage = next(c for c in template['Resources']['StorageTask']['Properties']['ContainerDefinitions'] if c['Name'] == 'storage')
@@ -361,14 +426,10 @@ def run(directory, package):
         definition = next(c for c in task['ContainerDefinitions'] if c['Name'] == name)
         environment = {item['Name']: str(item['Value']) for entry in definition.get('Environment', []) if (item := resolve_value(entry)) is not None}
         for entry in definition.get('Secrets', []):
-            item = entry
-            if 'Fn::If' in entry:
-                condition, yes, no = entry['Fn::If']
-                item = yes if resolve_value(template['Conditions'][condition]) else no
-            if item == {'Ref': 'AWS::NoValue'}:
-                continue
-            source = re.fullmatch(r'\$\{([^}]+)\}:([^:]+)::', item['ValueFrom']['Fn::Sub'])
-            environment[item['Name']] = fixture_secrets[source[1]][source[2]]
+            item = resolve_value(entry)
+            if item is not None:
+                source = re.fullmatch(r'([^:]+):([^:]+)::', item['ValueFrom'])
+                environment[item['Name']] = fixture_secrets[source[1]][source[2]]
         environment.update(overrides or {})
         entrypoint = definition.get('EntryPoint', [])
         port = 8080 if name == 'meta' else definition['PortMappings'][0]['ContainerPort']
@@ -481,6 +542,9 @@ server.serve_forever()
         assert any(notification.payload == 'reload schema' for notification in listener.notifies(timeout=5, stop_after=1)), 'ALTER TYPE did not notify PostgREST'
         writer.execute('DROP TYPE public.integration_type')
     publishable = {'apikey': keys['SUPABASE_PUBLISHABLE_KEY']}
+    for name, expected in [('ANON_KEY', []), ('SERVICE_ROLE_KEY', [{'value': 'private'}])]:
+        status, body = request(url+'/rest/v1/integration_secret?select=value', headers={'apikey': legacy[name]})
+        assert status == 200 and json.loads(body) == expected, f'Imported {name} did not retain its access role: HTTP {status}'
     for path in ['/', '/pg/', '/realtime/v1/', '/functions/v1/', '/graphql/v1', '/mcp']:
         assert request(url+path, headers={'apikey': keys['SUPABASE_SECRET_KEY']})[0] in (401, 403, 404), path
     for key in [None, 'invalid-key']:
@@ -499,6 +563,13 @@ server.serve_forever()
         with psycopg.connect(**database) as connection:
             connection.execute('INSERT INTO public.integration_secret VALUES (%s, %s)', (user['user']['id'], email))
     user = users[0]
+    legacy_access_token = sign_token({'alg': 'HS256', 'typ': 'JWT'},
+        {'sub': user['user']['id'], 'role': 'authenticated', 'aud': 'authenticated', 'exp': int(time.time()) + 3600},
+        lambda value: hmac.digest(legacy['JWT_SECRET'].encode(), value, 'sha256'))
+    legacy_headers = dict(publishable, Authorization='Bearer '+legacy_access_token)
+    status, body = request(url+'/rest/v1/integration_secret?select=value', headers=legacy_headers)
+    assert status == 200 and json.loads(body) == [{'value': user['user']['email']}], 'Imported signing secret did not preserve HS256 user access'
+    assert request(url+'/auth/v1/user', headers=legacy_headers)[0] == 200
     header = user['access_token'].split('.')[0]
     assert json.loads(base64.urlsafe_b64decode(header+'='*(-len(header)%4)))['alg'] == 'ES256'
     status, body = request(url+'/auth/v1/.well-known/jwks.json')
@@ -631,7 +702,7 @@ server.serve_forever()
     fixture_secrets['ApiSecret'] = dict(keys)
     url = restart_applications()
     publishable = {'apikey': keys['SUPABASE_PUBLISHABLE_KEY']}
-    for token in [user['access_token'], old_keys['ANON_KEY']]:
+    for token in [user['access_token'], old_keys['ANON_KEY'], legacy_access_token]:
         assert request(url+'/rest/v1/integration_secret', headers=dict(publishable, Authorization='Bearer '+token))[0] == 401
     status, body = request(url+'/auth/v1/token?grant_type=refresh_token', 'POST',
                            {'refresh_token': user['refresh_token']}, publishable)
