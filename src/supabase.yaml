@@ -50,6 +50,15 @@ Parameters:
       - internal
       - internet-facing
     Default: internal
+  EnablePrivateApi:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'false'
+    Description: Add an internal HTTPS ALB alongside an internet-facing API; adds an ALB charge.
+  PrivateHostedZoneId:
+    Type: String
+    Default: ''
+    Description: Existing VPC-associated private hosted zone for the additional API alias; empty means manage its DNS yourself.
   ApiClientSecurityGroupId:
     Type: String
     Description: Existing client security group allowed HTTPS access to the internal API when ManageApiIngress=true.
@@ -57,7 +66,7 @@ Parameters:
     AllowedPattern: '(^$|sg-([0-9a-f]{8}|[0-9a-f]{17}))'
   ManageApiIngress:
     Type: String
-    Description: For internal APIs, create the client HTTPS rule. Set false only when consuming infrastructure owns ingress to ApiSecurityGroupId.
+    Description: For private API access, create the client HTTPS rule. Set false only when consuming infrastructure owns ingress to PrivateApiSecurityGroupId.
     AllowedValues: ['true', 'false']
     Default: 'true'
   HostedZoneId:
@@ -365,6 +374,9 @@ Parameters:
     MinValue: 0
     Description: Alert below this measured free-memory floor in bytes. Zero omits the alarm for externally managed monitoring.
 Conditions:
+  AdditionalPrivateApi: !And [!Condition PublicApi, !Equals [!Ref EnablePrivateApi, 'true']]
+  HasPrivateApi: !Or [!Not [!Condition PublicApi], !Condition AdditionalPrivateApi]
+  CreatePrivateApiDns: !And [!Condition AdditionalPrivateApi, !Not [!Equals [!Ref PrivateHostedZoneId, '']]]
   UseSmtp: !Equals [!Ref EmailMode, smtp]
   UseEmailHook: !Equals [!Ref EmailMode, hook]
   HasSesSmtpSecret: !And [!Condition UseSmtp, !Not [!Equals [!Ref SesSmtpSecretArn, '']]]
@@ -393,7 +405,7 @@ Conditions:
   MonitorDatabaseMemory: !Not [!Equals [!Ref 'DatabaseFreeableMemoryAlarmBytes', 0]]
   PublicApi: !Equals [!Ref 'ApiExposure', internet-facing]
   ManagePrivateApiIngress: !And
-    - !Equals [!Ref 'ApiExposure', internal]
+    - !Condition HasPrivateApi
     - !Equals [!Ref 'ManageApiIngress', 'true']
   HasSesSmtpKmsKey: !And [!Condition UseSmtp, !Not [!Equals [!Ref SesSmtpKmsKeyArn, '']]]
   RunStudio: !Equals
@@ -547,7 +559,7 @@ Resources:
         config:
           ignore_checks: [W1030]
     Properties:
-      GroupId: !Ref 'ApiAlbSG'
+      GroupId: !If [AdditionalPrivateApi, !Ref PrivateApiAlbSG, !Ref ApiAlbSG]
       SourceSecurityGroupId: !Ref 'ApiClientSecurityGroupId'
       IpProtocol: tcp
       FromPort: 443
@@ -561,6 +573,26 @@ Resources:
       FromPort: 443
       ToPort: 443
       CidrIp: !Ref 'StudioClientCidr'
+  PrivateApiAlbSG:
+    Type: AWS::EC2::SecurityGroup
+    Condition: AdditionalPrivateApi
+    Properties:
+      GroupDescription: Private API HTTPS access
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          DestinationSecurityGroupId: !Ref GatewaySG
+  PrivateGatewayIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: AdditionalPrivateApi
+    Properties:
+      GroupId: !Ref GatewaySG
+      SourceSecurityGroupId: !Ref PrivateApiAlbSG
+      IpProtocol: tcp
+      FromPort: 8000
+      ToPort: 8000
   PublicGatewayIngress:
     Type: AWS::EC2::SecurityGroupIngress
     Properties:
@@ -2245,10 +2277,23 @@ Resources:
           Rollback: true
       AvailabilityZoneRebalancing: ENABLED
       EnableECSManagedTags: true
+      # The listener tag orders creation/deletion only when the extra listener exists.
+      Tags:
+        - !If
+          - AdditionalPrivateApi
+          - Key: PrivateApiListener
+            Value: !Ref PrivateApiListener
+          - !Ref AWS::NoValue
       LoadBalancers:
         - ContainerName: gateway
           ContainerPort: 8000
           TargetGroupArn: !Ref 'GatewayTargets'
+        - !If
+          - AdditionalPrivateApi
+          - ContainerName: gateway
+            ContainerPort: 8000
+            TargetGroupArn: !Ref PrivateGatewayTargets
+          - !Ref AWS::NoValue
       HealthCheckGracePeriodSeconds: 90
     DependsOn:
       - EncryptionCheck
@@ -3008,6 +3053,61 @@ Resources:
         DNSName: !GetAtt 'ApiAlb.DNSName'
         HostedZoneId: !GetAtt 'ApiAlb.CanonicalHostedZoneID'
     Condition: CreateDns
+  PrivateApiAlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Condition: AdditionalPrivateApi
+    Properties:
+      Scheme: internal
+      Type: application
+      Subnets: !Ref PrivateSubnetIds
+      SecurityGroups:
+        - !Ref 'PrivateApiAlbSG'
+      LoadBalancerAttributes:
+        - Key: routing.http.drop_invalid_header_fields.enabled
+          Value: 'true'
+        - Key: routing.http.desync_mitigation_mode
+          Value: strictest
+        - Key: idle_timeout.timeout_seconds
+          Value: '120'
+  PrivateGatewayTargets:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Condition: AdditionalPrivateApi
+    Properties:
+      VpcId: !Ref 'VpcId'
+      TargetType: ip
+      Port: 8000
+      Protocol: !If [UseServiceConnectTls, HTTPS, HTTP]
+      HealthCheckProtocol: !If [UseServiceConnectTls, HTTPS, HTTP]
+      HealthCheckPort: traffic-port
+      HealthCheckPath: /healthz
+      Matcher:
+        HttpCode: '200'
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '60'
+  PrivateApiListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: AdditionalPrivateApi
+    Properties:
+      LoadBalancerArn: !Ref 'PrivateApiAlb'
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref 'CertificateArn'
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref 'PrivateGatewayTargets'
+  PrivateApiDns:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref PrivateHostedZoneId
+      Name: !Ref 'ApiDomainName'
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt 'PrivateApiAlb.DNSName'
+        HostedZoneId: !GetAtt 'PrivateApiAlb.CanonicalHostedZoneID'
+    Condition: CreatePrivateApiDns
   AdminTask:
     Type: AWS::ECS::TaskDefinition
     Properties:
@@ -3353,7 +3453,36 @@ Resources:
         - HasAlarmTopic
         - - !Ref 'AlarmTopicArn'
         - !Ref 'AWS::NoValue'
+  PrivateApiErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: AdditionalPrivateApi
+    Properties:
+      AlarmDescription: Investigate HTTPCode_Target_5XX_Count
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !GetAtt 'PrivateApiAlb.LoadBalancerFullName'
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If
+        - HasAlarmTopic
+        - - !Ref 'AlarmTopicArn'
+        - !Ref 'AWS::NoValue'
 Outputs:
+  PrivateApiUrl:
+    Condition: HasPrivateApi
+    Value: !Sub 'https://${ApiDomainName}'
+  PrivateApiLoadBalancerDnsName:
+    Condition: HasPrivateApi
+    Value: !If [AdditionalPrivateApi, !GetAtt PrivateApiAlb.DNSName, !GetAtt ApiAlb.DNSName]
+  PrivateApiSecurityGroupId:
+    Condition: HasPrivateApi
+    Value: !If [AdditionalPrivateApi, !Ref PrivateApiAlbSG, !Ref ApiAlbSG]
   ApiUrl:
     Value: !Sub 'https://${ApiDomainName}'
   ApiLoadBalancerDnsName:
@@ -3395,7 +3524,7 @@ Rules:
         AssertDescription: Provide an existing tagged AWS Private CA for Service Connect TLS.
   PrivateApiRequiresClients:
     RuleCondition: !And
-      - !Equals [!Ref 'ApiExposure', internal]
+      - !Or [!Equals [!Ref ApiExposure, internal], !Equals [!Ref EnablePrivateApi, 'true']]
       - !Equals [!Ref 'ManageApiIngress', 'true']
     Assertions:
       - Assert: !Not [!Equals [!Ref 'ApiClientSecurityGroupId', '']]
@@ -3430,3 +3559,16 @@ Rules:
           - !Not [!Equals [!Ref EmailHookUri, '']]
           - !Not [!Equals [!Ref EmailHookSecretArn, '']]
         AssertDescription: Provide EmailHookUri and EmailHookSecretArn for hook email.
+  AdditionalPrivateApiRequiresPublicApi:
+    RuleCondition: !Equals [!Ref EnablePrivateApi, 'true']
+    Assertions:
+      - Assert: !Equals [!Ref ApiExposure, internet-facing]
+        AssertDescription: EnablePrivateApi adds an endpoint to a public API; internal APIs already provide private access.
+  PrivateDnsRequiresAdditionalApi:
+    RuleCondition: !Not [!Equals [!Ref PrivateHostedZoneId, '']]
+    Assertions:
+      - Assert: !And
+          - !Equals [!Ref EnablePrivateApi, 'true']
+          - !Equals [!Ref ApiExposure, internet-facing]
+          - !Not [!Equals [!Ref PrivateHostedZoneId, !Ref HostedZoneId]]
+        AssertDescription: Use a separate private zone with the additional API; internal-only APIs use HostedZoneId.

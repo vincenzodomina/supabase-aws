@@ -79,3 +79,28 @@ If the client stack is deployed later, set `ManageApiIngress=false` and leave `A
 If `HostedZoneId` is supplied, the stack creates the API alias in that existing zone: use a private zone associated with the VPC for internal access, or a public zone for internet-facing access. Otherwise manage the corresponding DNS yourself, pointing `ApiDomainName` at `ApiLoadBalancerDnsName`. DNS must match the supplied certificate. The API is HTTPS-only.
 
 Existing public deployments must explicitly set `ApiExposure=internet-facing` to preserve their exposure. Changing the scheme replaces the ALB and updates its DNS target; review the ALB replacement and plan a client/DNS cutover before switching an existing deployment.
+
+### Public browsers and private application clients
+
+Keep `ApiExposure=internet-facing` and opt into `EnablePrivateApi=true` to add an
+internal HTTPS ALB for the same gateway service and hostname. This adds one ALB,
+target group, listener, and security group; the existing public ALB is preserved.
+Both endpoints use the supplied certificate and the selected internal encryption mode.
+
+Set `PrivateHostedZoneId` to an existing private zone associated with the client VPCs
+to create the internal alias for `ApiDomainName`. Keep `HostedZoneId` pointed at the
+public zone. Alternatively, leave the private zone input empty and manage the alias
+using `PrivateApiLoadBalancerDnsName`. Do not publish the private alias in a public zone.
+Clients need working private DNS and routing; changing DNS does not grant access.
+
+`ApiClientSecurityGroupId` and `ManageApiIngress` control private ingress in both
+internal-only and dual-endpoint deployments. Consumer-owned rules should target
+`PrivateApiSecurityGroupId` on TCP 443. `PrivateApiUrl` is the same HTTPS hostname;
+public and private DNS determine the endpoint. The existing `ApiSecurityGroupId`
+continues to identify the primary ALB. An internal-only deployment already has
+private access and needs no additional ALB.
+
+Before enabling this mode, check zone associations, certificate coverage, ingress,
+and additional ALB cost. Validate public and private resolution, both target groups,
+ECS service updates, and rollback in a separately approved AWS environment. When
+disabling it, remove or update downstream references and private DNS first.
