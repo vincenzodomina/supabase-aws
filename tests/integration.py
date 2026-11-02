@@ -501,7 +501,9 @@ server.serve_forever()
         hosts = []
         for service in ['auth', 'rest', 'storage']:
             address = docker('inspect', '--format', '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}', prefix+'-'+service)
-            hosts.append(f'{service}.service-connect.invalid:{address}')
+            # Service Connect can supply an unreachable IPv6 alias even in IPv4-only networks.
+            hosts.extend([f'{service}.service-connect.invalid:{address}',
+                          f'{service}.service-connect.invalid:2600:f0f0::1'])
         gwport = start_service('gateway', {'SERVICE_NAMESPACE': 'service-connect.invalid'}, hosts=hosts)
         url = f'http://127.0.0.1:{gwport}'
         wait_http(url+'/healthz')
@@ -722,7 +724,7 @@ server.serve_forever()
     studioport = int(docker('port', prefix+'-meta', '3000').rsplit(':', 1)[1])
     wait_http(f'http://127.0.0.1:{studioport}/api/platform/profile')
     print(f'PASS: {ecs_architecture} application/helper containers and paired Studio/meta startup.', flush=True)
-    print('PASS: pinned Envoy routes through host-file aliases absent from DNS.', flush=True)
+    print('PASS: pinned Envoy routes through IPv4 host-file aliases despite unreachable IPv6 entries.', flush=True)
     assert invoke(lambdaport, 'Delete', physical_id=identity) == identity
     assert request(url+'/auth/v1/user', headers=dict(publishable, Authorization='Bearer '+user['access_token']))[0] == 200
     modes = docker('exec', prefix+'-gateway', 'stat', '-c', '%a', '/etc/envoy/lds.yaml')
