@@ -100,6 +100,11 @@ if ! jq -e 'type == "object" and (has("ArtifactsBucket") | not) and (has("Bootst
   echo 'Parameters must be a JSON object of single-line values. ArtifactsBucket, BootstrapKey, and CertificateKey are managed by deploy.sh.' >&2
   exit 1
 fi
+allowed=$(awk '/^Parameters:/{p=1;next} /^Conditions:/{p=0} p && /^  [A-Za-z0-9]+:$/ {gsub(/[: ]/, ""); print}' "$source_dir/supabase.yaml" | jq -Rsc 'split("\n")[:-1]')
+if ! jq -e --argjson allowed "$allowed" 'all(keys[]; . as $key | $allowed | index($key))' "$parameters" >/dev/null; then
+  echo 'Unknown template parameter. Check the supplied parameter names before deploying.' >&2
+  exit 1
+fi
 overrides=()
 while IFS= read -r value; do overrides+=("$value"); done < <(jq -r 'to_entries[] | "\(.key)=\(.value)"' "$parameters")
 scratch=$(mktemp -d)
@@ -116,6 +121,11 @@ else
   cat "$scratch/error" >&2
   exit 1
 fi
+
+case "$status" in
+  NEW|REVIEW_IN_PROGRESS|CREATE_COMPLETE|UPDATE_COMPLETE|UPDATE_ROLLBACK_COMPLETE|IMPORT_COMPLETE|IMPORT_ROLLBACK_COMPLETE) ;;
+  *) echo "Stack state $status does not permit deployment. Finish or recover the current operation first." >&2; exit 1 ;;
+esac
 
 ########## 4. Package and Upload Versioned Lambda and Certificate Artifacts ##########
 
@@ -144,6 +154,7 @@ protect_data() {
   local policy
   # Protect data independently of logical IDs and preserve any existing restrictions.
   policy=$(aws cloudformation get-stack-policy --stack-name "$stack_name" --output json)
+  if [[ -z "$policy" ]]; then policy='{}'; fi
   policy=$(jq -c '(.StackPolicyBody | if . then fromjson else
     {Statement: [{Effect:"Allow", Action:"Update:*", Principal:"*", Resource:"*"}]} end)
     | .Statement += [{Effect:"Deny", Action:["Update:Replace","Update:Delete"], Principal:"*", Resource:"*",
