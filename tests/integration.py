@@ -144,7 +144,7 @@ def run(directory, package):
             .serial_number(x509.random_serial_number()).not_valid_before(now-datetime.timedelta(minutes=1))
             .not_valid_after(now+datetime.timedelta(days=1))
             .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
-            .add_extension(x509.SubjectAlternativeName([x509.DNSName('db'), x509.IPAddress(ipaddress.ip_address('127.0.0.1'))]), critical=False)
+            .add_extension(x509.SubjectAlternativeName([x509.DNSName('db'), x509.DNSName('hook'), x509.IPAddress(ipaddress.ip_address('127.0.0.1'))]), critical=False)
             .sign(key, hashes.SHA256()))
     (directory/'rds-ca.pem').write_bytes(cert.public_bytes(serialization.Encoding.PEM))
     (directory/'server.key').write_bytes(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
@@ -333,7 +333,7 @@ def run(directory, package):
         if not isinstance(value, dict):
             return value
         if 'Ref' in value:
-            return values[value['Ref']]
+            return None if value['Ref'] == 'AWS::NoValue' else values[value['Ref']]
         if 'Fn::If' in value:
             condition, yes, no = value['Fn::If']
             return resolve_value(yes if resolve_value(template['Conditions'][condition]) else no)
@@ -344,7 +344,9 @@ def run(directory, package):
             return resolve_value(left) == resolve_value(right)
         if value == {'Fn::GetAtt': ['Database', 'Endpoint.Address']}:
             return 'db'
-        return re.sub(r'\$\{([^}]+)\}', lambda m: str(values[m[1]]), value['Fn::Sub'])
+        if 'Fn::Sub' in value:
+            return re.sub(r'\$\{([^}]+)\}', lambda m: str(values[m[1]]), value['Fn::Sub'])
+        return {key: resolve_value(item) for key, item in value.items()}
 
     storage = next(c for c in template['Resources']['StorageTask']['Properties']['ContainerDefinitions'] if c['Name'] == 'storage')
     tenant = next(item['Value'] for item in storage['Environment'] if item['Name'] == 'TENANT_ID')
@@ -357,8 +359,14 @@ def run(directory, package):
         task = template['Resources'][task_name]['Properties']
         assert task['RuntimePlatform']['CpuArchitecture'] == {'Ref': 'EcsCpuArchitecture'}
         definition = next(c for c in task['ContainerDefinitions'] if c['Name'] == name)
-        environment = {item['Name']: str(resolve_value(item['Value'])) for item in definition.get('Environment', [])}
-        for item in definition.get('Secrets', []):
+        environment = {item['Name']: str(item['Value']) for entry in definition.get('Environment', []) if (item := resolve_value(entry)) is not None}
+        for entry in definition.get('Secrets', []):
+            item = entry
+            if 'Fn::If' in entry:
+                condition, yes, no = entry['Fn::If']
+                item = yes if resolve_value(template['Conditions'][condition]) else no
+            if item == {'Ref': 'AWS::NoValue'}:
+                continue
             source = re.fullmatch(r'\$\{([^}]+)\}:([^:]+)::', item['ValueFrom']['Fn::Sub'])
             environment[item['Name']] = fixture_secrets[source[1]][source[2]]
         environment.update(overrides or {})
@@ -379,6 +387,45 @@ def run(directory, package):
           mounts=[prefix+':/shared'], command=command, platform=ecs_platform)
     assert docker('wait', prefix+'-certificates') == '0', 'Certificate download failed'
     certmount = prefix+':/certs:ro'
+
+    hook_key = base64.b64encode(secrets.token_bytes(32)).decode()
+    fixture_secrets['EmailHookSecretArn'] = {'secret': 'v1,whsec_'+hook_key}
+    properties['EmailHookSecretArn'] = sm.create_secret(Name='EmailHookSecretArn',
+        SecretString=json.dumps(fixture_secrets['EmailHookSecretArn']))['ARN']
+    (directory/'hook.py').write_text("""
+import base64, hashlib, hmac, http.server, json, os, pathlib, ssl
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *args): pass
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers['Content-Length']))
+        message = (self.headers['webhook-id']+'.'+self.headers['webhook-timestamp']+'.').encode()+body
+        signature = base64.b64encode(hmac.digest(base64.b64decode(os.environ['HOOK_KEY']), message, hashlib.sha256)).decode()
+        valid = any(hmac.compare_digest(value, 'v1,'+signature) for value in self.headers['webhook-signature'].split())
+        if valid: pathlib.Path('/fixture/hook-result.json').write_text(json.dumps(json.loads(body)))
+        self.send_response(200 if valid else 401)
+        self.send_header('Content-Type', 'application/json')
+        self.end_headers()
+        self.wfile.write(b'{}')
+server = http.server.HTTPServer(('0.0.0.0', 443), Handler)
+context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+context.load_cert_chain('/fixture/rds-ca.pem', '/fixture/server.key')
+server.socket = context.wrap_socket(server.socket, server_side=True)
+server.serve_forever()
+""")
+    start('email-hook', LAMBDA_IMAGE, {'HOOK_KEY': hook_key}, alias='hook',
+          mounts=[str(directory)+':/fixture'], entrypoint='/var/lang/bin/python', command=['/fixture/hook.py'])
+    values.update(EmailMode='hook', EmailHookUri='https://hook/')
+    authport = start_service('auth', {'GOTRUE_DISABLE_SIGNUP': 'false', 'SSL_CERT_FILE': '/certs/rds-ca.pem'})
+    wait_http(f'http://127.0.0.1:{authport}/health')
+    status, body = request(f'http://127.0.0.1:{authport}/signup', 'POST',
+                           {'email': 'hook@example.com', 'password': password})
+    assert status == 200, 'Hook signup returned HTTP '+str(status)
+    assert not json.loads(body).get('access_token'), 'Hook signup bypassed email confirmation'
+    assert json.loads((directory/'hook-result.json').read_text())['user']['email'] == 'hook@example.com'
+    docker('rm', '-f', prefix+'-auth')
+    containers.remove(prefix+'-auth')
+    values['EmailMode'] = 'smtp'
+    print('PASS: hook-only Auth signup uses verified HTTPS and a valid webhook signature without SMTP credentials.', flush=True)
 
     def start_applications():
         authport = start_service('auth', {'GOTRUE_DISABLE_SIGNUP': 'false', 'GOTRUE_MAILER_AUTOCONFIRM': 'true'})

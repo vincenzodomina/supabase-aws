@@ -7,7 +7,7 @@ The [README quick start](../README.md#quickstart) deploys the stack in one comma
 - An AWS account and permission to deploy CloudFormation, IAM, ECS, RDS, S3, Secrets Manager, Cloud Map, Lambda, CloudWatch, and load balancers. Optional DNS and Service Connect TLS configuration also require the corresponding Route 53, Private CA, and KMS permissions.
 - An existing ACM certificate in the deployment region covering the API hostname and, if enabled, the Studio hostname.
 - An existing private S3 bucket in the deployment region for templates, Lambda ZIPs, and the RDS CA bundle. The deployer needs `s3:PutObject`/`s3:GetObject`; certificate readers receive access to only their CA object. Uploads use SSE-S3 encryption. Retain artifacts while referenced by current or rollback deployments; task replacements still download the CA bundle.
-- An SES-verified sender identity with production sending access, plus a Secrets Manager JSON secret containing `username` and `password` for **SES SMTP credentials**. These are not ordinary AWS API credentials. SES identity verification, sandbox removal, quotas, and SMTP credential rotation remain account-level responsibilities.
+- For SMTP mode (the default), an SES-verified sender identity with production sending access, plus a Secrets Manager JSON secret containing `username` and `password` for **SES SMTP credentials**. These are not ordinary AWS API credentials. SES identity verification, sandbox removal, quotas, and SMTP credential rotation remain account-level responsibilities. An existing [HTTPS email hook](#auth-and-email-configuration) can replace SMTP.
 - If that secret uses a customer-managed KMS key, supply `SesSmtpKmsKeyArn`. The key policy must allow the generated `AuthExecutionRole` to decrypt, directly or through IAM delegation; cross-account secrets also need a secret resource policy. The stack grants decryption only through Secrets Manager for that secret, and creates no key. Leave the parameter empty for the AWS-managed Secrets Manager key.
 
 See [networking](Networking.md) for subnets, private clients, DNS, outbound access, and encryption prerequisites.
@@ -52,6 +52,21 @@ Stack outputs include `ApiSecurityGroupId`, `GatewaySecurityGroupId`, `DatabaseS
 
 `StorageTenantId` defaults to the stack name when empty. Supply the original tenant ID when preserving an existing Storage object layout: S3 object keys include this prefix. Keep the bucket, tenant ID, and database Storage metadata together. Changing the parameter does not migrate objects and can make existing files unreachable.
 
+## Auth and email configuration
+
+SES SMTP remains the default. `EnablePhoneSignup`, `EnablePhoneAutoconfirm`, and
+`EnableEmailAutoconfirm` default to `false`; opt in explicitly. Autoconfirm bypasses
+address/number verification. The stack does not provision SMS delivery or a provider.
+
+To use an existing HTTPS send-email hook, set `EmailMode=hook`, `EmailHookUri`, and
+`EmailHookSecretArn`. The secret contains JSON `{"secret":"v1,whsec_<base64-key>"}`
+using the upstream Auth signing-secret format. Supply `EmailHookKmsKeyArn` for a
+customer-managed key whose policy permits `AuthExecutionRole`. Auth reads only the
+selected delivery mode's secret; hook mode requires no SES credentials or sender.
+The hook owner provides delivery, signature verification, availability, and private
+endpoint ingress if applicable. Auth already has HTTPS egress. No hook server is created.
+After rotating either delivery secret, change `CredentialRevision` to replace tasks.
+
 ## Optional administration
 
 Set `EnableStudio=true`, provide `StudioDomainName`, and narrow `StudioClientCidr` to your private/VPN clients. Create the Studio DNS record pointing at `StudioLoadBalancerDnsName`; it must resolve for those clients. The certificate must cover this hostname.
@@ -66,7 +81,7 @@ Fresh deployments with Studio disabled create no administration resources. Disab
 
 Install the [test dependencies](../CONTRIBUTION.md#validation) and run commands from the repository root.
 
-Manual AWS acceptance is separate from the local/CI suite. Before production use, deploy an approved disposable AWS stack and verify: database bootstrap; all ECS services stable; actual signup/invitation and recovery emails through SES; token refresh and MFA; authenticated/anonymous RLS behavior; private S3 upload/download/delete and signed URLs; task replacement under traffic; Studio unreachable outside its allowed network; and snapshot restoration.
+Manual AWS acceptance is separate from the local/CI suite. Before production use, deploy an approved disposable AWS stack and verify: database bootstrap; all ECS services stable; actual signup/invitation and recovery emails through the selected delivery mode; token refresh and MFA; authenticated/anonymous RLS behavior; private S3 upload/download/delete and signed URLs; task replacement under traffic; Studio unreachable outside its allowed network; and snapshot restoration.
 
 From a host with private API access and the test dependencies installed, use `.venv/bin/python tests/acceptance.py --stack-name NAME --region REGION --profile PROFILE` for a Storage API round trip. It creates and deletes test data, requires access to the API secret, and leaves S3 version history subject to the bucket retention policy.
 

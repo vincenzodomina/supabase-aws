@@ -68,6 +68,34 @@ else: sys.exit('Unexpected CLI call: '+repr(args))
 '''
 
 
+def configured(document, overrides):
+    parameters = {name: spec.get('Default', name) for name, spec in document['Parameters'].items()} | overrides
+    def resolve(value):
+        if isinstance(value, list):
+            return [resolved for item in value if (resolved := resolve(item)) is not None]
+        if not isinstance(value, dict):
+            return value
+        if 'Ref' in value:
+            return None if value['Ref'] == 'AWS::NoValue' else parameters.get(value['Ref'], value)
+        if 'Condition' in value and len(value) == 1:
+            return resolve(document['Conditions'][value['Condition']])
+        if 'Fn::If' in value:
+            condition, yes, no = value['Fn::If']
+            return resolve(yes if resolve(document['Conditions'][condition]) else no)
+        if 'Fn::Equals' in value:
+            left, right = value['Fn::Equals']
+            return resolve(left) == resolve(right)
+        if 'Fn::Not' in value:
+            return not resolve(value['Fn::Not'][0])
+        if 'Fn::And' in value:
+            return all(resolve(item) for item in value['Fn::And'])
+        if 'Fn::Or' in value:
+            return any(resolve(item) for item in value['Fn::Or'])
+        return {key: resolve(item) for key, item in value.items()}
+    return {name: resolve(resource) for name, resource in document['Resources'].items()
+            if 'Condition' not in resource or resolve(document['Conditions'][resource['Condition']])}
+
+
 class DeploymentTest(unittest.TestCase):
     def run_deploy(self, scenario, parameters=None, role_arn=None, extra_args=(), source=ROOT/'src'):
         with tempfile.TemporaryDirectory() as directory:
@@ -305,6 +333,32 @@ class ArtifactTest(unittest.TestCase):
         self.assertEqual(outputs['ServiceConnectNamespaceArn'],
                          {'Value': {'Fn::GetAtt': ['TlsNamespace', 'Arn']}, 'Condition': 'UseServiceConnectTls'})
         self.assertFalse(any('Export' in output for output in outputs.values()))
+
+    def test_auth_delivery_modes_keep_secrets_and_permissions_separate(self):
+        document, errors = decode_str(subprocess.check_output([str(ROOT/'src/deploy.sh'), '--template'], text=True))
+        self.assertFalse(errors)
+        for mode in ['smtp', 'hook']:
+            with self.subTest(mode=mode):
+                resources = configured(document, {'EmailMode': mode, 'SesSmtpSecretArn': 'smtp-secret',
+                    'EmailHookSecretArn': 'hook-secret', 'SesSmtpKmsKeyArn': 'smtp-key', 'EmailHookKmsKeyArn': 'hook-key'})
+                auth = next(c for c in resources['AuthTask']['Properties']['ContainerDefinitions'] if c['Name'] == 'auth')
+                env = {item['Name']: item['Value'] for item in auth['Environment']}
+                secrets = {item['Name']: item['ValueFrom'] for item in auth['Secrets']}
+                self.assertEqual(env['GOTRUE_HOOK_SEND_EMAIL_ENABLED'], 'true' if mode == 'hook' else 'false')
+                self.assertEqual('GOTRUE_SMTP_USER' in secrets, mode == 'smtp')
+                self.assertEqual('GOTRUE_HOOK_SEND_EMAIL_SECRETS' in secrets, mode == 'hook')
+                self.assertEqual('AuthSmtp' in resources, mode == 'smtp')
+                permissions = json.dumps(resources['AuthExecutionRole'])
+                self.assertIn(mode+'-secret', permissions)
+                self.assertIn(mode+'-key', permissions)
+                self.assertNotIn(('hook' if mode == 'smtp' else 'smtp')+'-secret', permissions)
+                for key in ['GOTRUE_EXTERNAL_PHONE_ENABLED', 'GOTRUE_SMS_AUTOCONFIRM', 'GOTRUE_MAILER_AUTOCONFIRM']:
+                    self.assertEqual(env[key], 'false')
+        resources = configured(document, dict.fromkeys(['EnablePhoneSignup', 'EnablePhoneAutoconfirm', 'EnableEmailAutoconfirm'], 'true'))
+        auth = next(c for c in resources['AuthTask']['Properties']['ContainerDefinitions'] if c['Name'] == 'auth')
+        env = {item['Name']: item['Value'] for item in auth['Environment']}
+        for key in ['GOTRUE_EXTERNAL_PHONE_ENABLED', 'GOTRUE_SMS_AUTOCONFIRM', 'GOTRUE_MAILER_AUTOCONFIRM']:
+            self.assertEqual(env[key], 'true')
 
     def test_internal_encryption_has_two_protected_modes_and_gates_all_services(self):
         template, errors = decode_str(subprocess.check_output([str(ROOT/'src/deploy.sh'), '--template'], text=True, timeout=10))
