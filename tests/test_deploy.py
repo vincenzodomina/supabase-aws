@@ -334,6 +334,11 @@ class ArtifactTest(unittest.TestCase):
         self.assertEqual(outputs['DatabasePort']['Value'], {'Fn::GetAtt': ['Database', 'Endpoint.Port']})
         self.assertEqual(outputs['ServiceConnectNamespaceArn'],
                          {'Value': {'Fn::GetAtt': ['TlsNamespace', 'Arn']}, 'Condition': 'UseServiceConnectTls'})
+        self.assertEqual(outputs['ServiceConnectPrivateCaArn'],
+                         {'Value': {'Ref': 'ServiceConnectPrivateCaArn'}, 'Condition': 'UseServiceConnectTls'})
+        self.assertEqual(outputs['ServiceConnectRoleArn'],
+                         {'Value': {'Fn::GetAtt': ['ServiceConnectRole', 'Arn']}, 'Condition': 'UseServiceConnectTls'})
+        self.assertEqual(outputs['RdsCaS3Uri'], {'Value': {'Fn::Sub': 's3://${ArtifactsBucket}/${CertificateKey}'}})
         self.assertFalse(any('Export' in output for output in outputs.values()))
 
     def test_optional_private_api_preserves_single_endpoint_defaults(self):

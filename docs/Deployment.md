@@ -48,7 +48,20 @@ Envoy uses its pinned official image. `src/deploy.sh` embeds `src/gateway-entryp
 
 ## Embedding configuration
 
-Stack outputs include `ApiSecurityGroupId`, `GatewaySecurityGroupId`, `DatabaseSecurityGroupId`, and `DatabasePort`. `ServiceConnectNamespaceArn` is available only in Service Connect TLS mode. Outputs create no CloudFormation exports or additional access rules; the consuming infrastructure chooses how to pass them to clients. For application stacks deployed later, see [consumer-managed API ingress](Networking.md#api-access-and-dns). Joining the Service Connect namespace also requires compatible client service configuration and explicit network access; ordinary VPC clients should use the HTTPS API URL.
+Stack outputs include `ApiSecurityGroupId`, `GatewaySecurityGroupId`, `DatabaseSecurityGroupId`, and `DatabasePort`. Outputs create no CloudFormation exports or additional access rules; the consuming infrastructure chooses how to pass them to clients. For application stacks deployed later, see [consumer-managed API ingress](Networking.md#api-access-and-dns).
+
+In Service Connect TLS mode, `ServiceConnectNamespaceArn`, `ServiceConnectPrivateCaArn`
+and `ServiceConnectRoleArn` identify the existing TLS resources. Consuming ECS services
+need compatible configuration and explicit network access; their deployment identity
+needs scoped `iam:PassRole` permission for the infrastructure role. Deploy Supabase
+first and retain these resources while clients use them. See [TLS permissions and
+lifecycle](Networking.md#service-connect-tls); ordinary VPC clients should use the HTTPS API URL.
+
+`RdsCaS3Uri` identifies the uploaded RDS CA bundle in either encryption mode. Consumers
+reading it at startup need `cloudformation:DescribeStacks` on this stack and `s3:GetObject`
+on that object. The URI follows the content-addressed `CertificateKey`; retain old
+objects while current or rollback tasks reference them. Download the bundle before
+starting the database client and configure certificate and hostname verification.
 
 `StorageTenantId` defaults to the stack name when empty. Supply the original tenant ID when preserving an existing Storage object layout: S3 object keys include this prefix. Keep the bucket, tenant ID, and database Storage metadata together. Changing the parameter does not migrate objects and can make existing files unreachable.
 

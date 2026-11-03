@@ -3588,6 +3588,14 @@ Outputs:
   ServiceConnectNamespaceArn:
     Value: !GetAtt 'TlsNamespace.Arn'
     Condition: UseServiceConnectTls
+  ServiceConnectPrivateCaArn:
+    Value: !Ref ServiceConnectPrivateCaArn
+    Condition: UseServiceConnectTls
+  ServiceConnectRoleArn:
+    Value: !GetAtt ServiceConnectRole.Arn
+    Condition: UseServiceConnectTls
+  RdsCaS3Uri:
+    Value: !Sub 's3://${ArtifactsBucket}/${CertificateKey}'
   LogGroupName:
     Value: !Ref 'LogGroup'
   StudioUrl:
