@@ -66,6 +66,11 @@ Parameters:
       - internal
       - internet-facing
     Default: internal
+  PublicApiEnabled:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'true'
+    Description: Set false to return HTTP 503 from an internet-facing API. Private API access is unaffected.
   EnablePrivateApi:
     Type: String
     AllowedValues: ['true', 'false']
@@ -425,6 +430,7 @@ Conditions:
   MonitorDatabaseConnections: !Not [!Equals [!Ref 'DatabaseConnectionAlarmThreshold', 0]]
   MonitorDatabaseMemory: !Not [!Equals [!Ref 'DatabaseFreeableMemoryAlarmBytes', 0]]
   PublicApi: !Equals [!Ref 'ApiExposure', internet-facing]
+  ForwardApi: !Or [!Not [!Condition PublicApi], !Equals [!Ref PublicApiEnabled, 'true']]
   ManagePrivateApiIngress: !And
     - !Condition HasPrivateApi
     - !Equals [!Ref 'ManageApiIngress', 'true']
@@ -2345,9 +2351,12 @@ Resources:
             Value: !Ref PrivateApiListener
           - !Ref AWS::NoValue
       LoadBalancers:
-        - ContainerName: gateway
-          ContainerPort: 8000
-          TargetGroupArn: !Ref 'GatewayTargets'
+        - !If
+          - ForwardApi
+          - ContainerName: gateway
+            ContainerPort: 8000
+            TargetGroupArn: !Ref 'GatewayTargets'
+          - !Ref AWS::NoValue
         - !If
           - AdditionalPrivateApi
           - ContainerName: gateway
@@ -3101,8 +3110,15 @@ Resources:
         - CertificateArn: !Ref 'CertificateArn'
       SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
       DefaultActions:
-        - Type: forward
-          TargetGroupArn: !Ref 'GatewayTargets'
+        - !If
+          - ForwardApi
+          - Type: forward
+            TargetGroupArn: !Ref 'GatewayTargets'
+          - Type: fixed-response
+            FixedResponseConfig:
+              StatusCode: '503'
+              ContentType: text/plain
+              MessageBody: Service temporarily unavailable
   ApiDns:
     Type: AWS::Route53::RecordSet
     Properties:

@@ -80,6 +80,18 @@ If `HostedZoneId` is supplied, the stack creates the API alias in that existing 
 
 Existing public deployments must explicitly set `ApiExposure=internet-facing` to preserve their exposure. Changing the scheme replaces the ALB and updates its DNS target; review the ALB replacement and plan a client/DNS cutover before switching an existing deployment.
 
+### Public maintenance
+
+Set `PublicApiEnabled=false` to return HTTP 503 from an internet-facing API listener.
+Private endpoints continue forwarding requests, including internal-only deployments.
+The default is `true`; set it back to `true` to reopen public access. The ALB, DNS,
+database and buckets stay in place. Gateway tasks detach from the public target group
+during maintenance and reattach on reopening, which rolls the gateway service.
+
+This controls public routing; it does not stop private writers or guarantee immediate
+termination of existing connections. Review the update and verify public 503 responses,
+private access and target health after each transition in an approved AWS environment.
+
 ### Public browsers and private application clients
 
 Keep `ApiExposure=internet-facing` and opt into `EnablePrivateApi=true` to add an

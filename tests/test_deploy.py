@@ -339,10 +339,12 @@ class ArtifactTest(unittest.TestCase):
     def test_optional_private_api_preserves_single_endpoint_defaults(self):
         document, errors = decode_str(subprocess.check_output([str(ROOT/'src/deploy.sh'), '--template'], text=True))
         self.assertFalse(errors)
+        self.assertEqual(document['Parameters']['PublicApiEnabled']['Default'], 'true')
         for exposure, additional in [('internal', 'false'), ('internet-facing', 'false'), ('internet-facing', 'true')]:
             for encryption in ['vpc', 'service-connect-tls']:
-                for managed in ['true', 'false']:
+                for managed, enabled in [('true', 'true'), ('true', 'false'), ('false', 'true'), ('false', 'false')]:
                     resources = configured(document, {'ApiExposure': exposure, 'EnablePrivateApi': additional,
+                        'PublicApiEnabled': enabled,
                         'InternalTrafficEncryption': encryption, 'ManageApiIngress': managed,
                         'ApiClientSecurityGroupId': 'sg-client', 'PrivateHostedZoneId': 'private-zone' if additional == 'true' else ''})
                     dual = additional == 'true'
@@ -352,8 +354,18 @@ class ArtifactTest(unittest.TestCase):
                     self.assertEqual('PublicHttps' in resources, exposure == 'internet-facing')
                     self.assertEqual('PrivateApiHttps' in resources, managed == 'true' and (dual or exposure == 'internal'))
                     gateway = resources['GatewayService']['Properties']
-                    self.assertEqual(len(gateway['LoadBalancers']), 2 if dual else 1)
+                    forwarding = exposure == 'internal' or enabled == 'true'
+                    action = resources['ApiListener']['Properties']['DefaultActions'][0]
+                    self.assertEqual(action['Type'], 'forward' if forwarding else 'fixed-response')
+                    if not forwarding:
+                        self.assertEqual(action['FixedResponseConfig']['StatusCode'], '503')
+                        self.assertNotIn('TargetGroupArn', action)
+                    targets = [item['TargetGroupArn'] for item in gateway['LoadBalancers']]
+                    self.assertEqual(targets, ([{'Ref': 'GatewayTargets'}] if forwarding else []) +
+                                     ([{'Ref': 'PrivateGatewayTargets'}] if dual else []))
                     if dual:
+                        self.assertEqual(resources['PrivateApiListener']['Properties']['DefaultActions'],
+                                         [{'Type': 'forward', 'TargetGroupArn': {'Ref': 'PrivateGatewayTargets'}}])
                         self.assertIn({'Key': 'PrivateApiListener', 'Value': {'Ref': 'PrivateApiListener'}}, gateway['Tags'])
                         self.assertEqual(resources['PrivateApiAlb']['Properties']['Scheme'], 'internal')
                         self.assertEqual(resources['PrivateApiListener']['Properties']['Port'], 443)
